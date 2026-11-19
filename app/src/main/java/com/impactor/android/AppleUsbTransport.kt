@@ -12,8 +12,8 @@ import java.io.Closeable
 /**
  * Android USB transport for Apple device diagnostics.
  *
- * Detects candidate usbmux interfaces using USB descriptors.
- * This is not yet a complete Apple usbmux implementation.
+ * This class can inspect and claim a likely Apple usbmux interface.
+ * It does NOT yet implement usbmux, Lockdown, pairing, signing, or IPA installation.
  */
 class AppleUsbTransport private constructor(
     private val connection: UsbDeviceConnection,
@@ -55,6 +55,9 @@ class AppleUsbTransport private constructor(
         private const val APPLE_USB_SUBCLASS = 0xFE
         private const val APPLE_USB_PROTOCOL = 0x02
 
+        // Conservative transfer size for compatibility with older Android versions.
+        private const val MAX_COMPAT_TRANSFER_SIZE = 16 * 1024
+
         data class InterfaceInfo(
             val interfaceNumber: Int,
             val alternateSetting: Int,
@@ -80,8 +83,41 @@ class AppleUsbTransport private constructor(
                 intf.interfaceProtocol == APPLE_USB_PROTOCOL
         }
 
+        private fun endpointCandidates(intf: UsbInterface): List<Candidate> {
+            val inputs = mutableListOf<UsbEndpoint>()
+            val outputs = mutableListOf<UsbEndpoint>()
+
+            for (index in 0 until intf.endpointCount) {
+                val endpoint = intf.getEndpoint(index)
+
+                if (endpoint.type != UsbConstants.USB_ENDPOINT_XFER_BULK) {
+                    continue
+                }
+
+                when (endpoint.direction) {
+                    UsbConstants.USB_DIR_IN -> inputs.add(endpoint)
+                    UsbConstants.USB_DIR_OUT -> outputs.add(endpoint)
+                }
+            }
+
+            if (inputs.isEmpty() || outputs.isEmpty()) {
+                return emptyList()
+            }
+
+            return inputs.flatMap { input ->
+                outputs.map { output ->
+                    Candidate(
+                        usbInterface = intf,
+                        input = input,
+                        output = output,
+                        isLikelyUsbmux = matchesUsbmux(intf)
+                    )
+                }
+            }
+        }
+
         /**
-         * Enumerate all USB interfaces and their bulk endpoints.
+         * Inspect every interface exposed by Android.
          */
         fun inspectInterfaces(device: UsbDevice): List<InterfaceInfo> {
             val result = mutableListOf<InterfaceInfo>()
@@ -127,58 +163,77 @@ class AppleUsbTransport private constructor(
         }
 
         /**
-         * Find interfaces containing both bulk IN and bulk OUT endpoints.
-         * Likely usbmux interfaces are listed first.
+         * Find all interfaces with bulk IN and bulk OUT endpoints.
+         * Likely usbmux candidates are listed first.
          */
         fun candidates(device: UsbDevice): List<Candidate> {
             val result = mutableListOf<Candidate>()
 
             for (index in 0 until device.interfaceCount) {
-                val intf = device.getInterface(index)
+                result.addAll(
+                    endpointCandidates(device.getInterface(index))
+                )
+            }
 
-                var input: UsbEndpoint? = null
-                var output: UsbEndpoint? = null
-
-                for (endpointIndex in 0 until intf.endpointCount) {
-                    val endpoint = intf.getEndpoint(endpointIndex)
-
-                    if (endpoint.type != UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                        continue
-                    }
-
-                    when (endpoint.direction) {
-                        UsbConstants.USB_DIR_IN -> {
-                            if (input == null) input = endpoint
-                        }
-
-                        UsbConstants.USB_DIR_OUT -> {
-                            if (output == null) output = endpoint
-                        }
-                    }
+            return result
+                .distinctBy {
+                    Triple(
+                        it.usbInterface.id,
+                        it.usbInterface.alternateSetting,
+                        Pair(it.input.address, it.output.address)
+                    )
                 }
+                .sortedByDescending { it.isLikelyUsbmux }
+        }
 
-                if (input != null && output != null) {
-                    result.add(
-                        Candidate(
-                            usbInterface = intf,
-                            input = input,
-                            output = output,
-                            isLikelyUsbmux = matchesUsbmux(intf)
-                        )
+        /**
+         * Strictly open the interface matching Apple usbmux descriptors.
+         *
+         * This method never falls back to a generic USB interface.
+         */
+        fun openUsbmux(
+            manager: UsbManager,
+            device: UsbDevice
+        ): AppleUsbTransport {
+
+            check(manager.hasPermission(device)) {
+                "USB permission is missing. Request permission and try again."
+            }
+
+            val matchingCandidates = candidates(device)
+                .filter { it.isLikelyUsbmux }
+
+            check(matchingCandidates.isNotEmpty()) {
+                "No Apple usbmux interface with bulk IN and OUT endpoints was found. " +
+                    "Expected descriptor FF/FE/02."
+            }
+
+            val errors = mutableListOf<String>()
+
+            for ((index, candidate) in matchingCandidates.withIndex()) {
+                try {
+                    return openCandidate(manager, device, candidate)
+                } catch (error: Exception) {
+                    errors.add(
+                        "Candidate $index, interface ${candidate.usbInterface.id}, " +
+                            "alternate ${candidate.usbInterface.alternateSetting}: " +
+                            (error.message ?: "Unknown error")
                     )
                 }
             }
 
-            return result.sortedByDescending {
-                it.isLikelyUsbmux
-            }
+            error(
+                "Apple usbmux interface was detected but Android could not claim it.\n" +
+                    errors.joinToString("\n") +
+                    "\nCheck the USB connection, device state, and Android USB-host support."
+            )
         }
 
         /**
-         * Opens a candidate USB interface.
+         * Generic diagnostic open.
          *
-         * Unverified interfaces are rejected unless diagnostic mode
-         * is explicitly enabled.
+         * allowUnverifiedInterface should only be true for testing.
+         * Do not use a generic interface as an Apple protocol connection.
          */
         fun open(
             manager: UsbManager,
@@ -192,23 +247,45 @@ class AppleUsbTransport private constructor(
             }
 
             val candidate = candidates(device).getOrNull(candidateIndex)
-                ?: error(
-                    "No USB interface with both bulk IN and bulk OUT endpoints found"
-                )
+                ?: error("No USB interface with bulk IN and bulk OUT endpoints found")
 
             check(candidate.isLikelyUsbmux || allowUnverifiedInterface) {
-                "Selected interface does not match the expected Apple usbmux " +
-                    "descriptor FF/FE/02. Diagnostic mode is required."
+                "Selected interface does not match Apple usbmux descriptor FF/FE/02."
             }
+
+            return openCandidate(manager, device, candidate)
+        }
+
+        private fun openCandidate(
+            manager: UsbManager,
+            device: UsbDevice,
+            candidate: Candidate
+        ): AppleUsbTransport {
 
             val connection = manager.openDevice(device)
                 ?: error("Android could not open the USB device")
 
-            if (!connection.claimInterface(candidate.usbInterface, true)) {
+            val claimed = try {
+                // force = true asks Android to force the interface claim.
+                connection.claimInterface(candidate.usbInterface, true)
+            } catch (error: Exception) {
+                connection.close()
+                throw IllegalStateException(
+                    "USB claim threw an exception: ${error.message}",
+                    error
+                )
+            }
+
+            if (!claimed) {
                 connection.close()
 
                 error(
-                    "Could not claim USB interface ${candidate.usbInterface.id}"
+                    "Could not claim USB interface ${candidate.usbInterface.id}. " +
+                        "Descriptor: " +
+                        "${candidate.usbInterface.interfaceClass.toString(16).uppercase()}/" +
+                        "${candidate.usbInterface.interfaceSubclass.toString(16).uppercase()}/" +
+                        "${candidate.usbInterface.interfaceProtocol.toString(16).uppercase()}, " +
+                        "alternate setting ${candidate.usbInterface.alternateSetting}."
                 )
             }
 
@@ -231,6 +308,11 @@ class AppleUsbTransport private constructor(
             "USB write buffer is empty"
         }
 
+        check(data.size <= MAX_COMPAT_TRANSFER_SIZE) {
+            "USB write exceeds the compatibility limit of " +
+                "$MAX_COMPAT_TRANSFER_SIZE bytes."
+        }
+
         return connection.bulkTransfer(
             output,
             data,
@@ -241,12 +323,12 @@ class AppleUsbTransport private constructor(
 
     @Synchronized
     fun read(
-        maxBytes: Int = 64 * 1024,
+        maxBytes: Int = MAX_COMPAT_TRANSFER_SIZE,
         timeoutMs: Int = 3000
     ): ByteArray? {
 
-        require(maxBytes in 1..(1024 * 1024)) {
-            "Invalid USB read size"
+        require(maxBytes in 1..MAX_COMPAT_TRANSFER_SIZE) {
+            "Read size must be between 1 and $MAX_COMPAT_TRANSFER_SIZE bytes."
         }
 
         val buffer = ByteArray(maxBytes)
@@ -270,6 +352,8 @@ class AppleUsbTransport private constructor(
             connection.releaseInterface(usbInterface)
         }
 
-        connection.close()
+        runCatching {
+            connection.close()
+        }
     }
 }
