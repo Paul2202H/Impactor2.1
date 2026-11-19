@@ -66,8 +66,14 @@ class MainActivity : ComponentActivity() {
     private var selectedDevice: UsbDevice? = null
     private var stagedIpa: IpaInspector.Result? = null
 
+    private var receiverRegistered = false
+
     private val permissionAction =
         "com.impactor.android.USB_PERMISSION"
+
+    // ---------------------------------------------------------
+    // USB BROADCAST RECEIVER
+    // ---------------------------------------------------------
 
     private val usbReceiver = object : BroadcastReceiver() {
 
@@ -95,31 +101,57 @@ class MainActivity : ComponentActivity() {
                         false
                     )
 
-                    status.value =
-                        if (granted && device != null) {
-                            selectedDevice = device
+                    if (granted && device != null) {
+                        selectedDevice = device
+                        status.value =
                             "USB permission granted. Device is not paired yet."
-                        } else {
+                    } else {
+                        status.value =
                             "USB permission denied or device disconnected."
-                        }
+                    }
 
                     refreshDevices()
                 }
 
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
+
                     status.value = "USB device attached"
                     refreshDevices()
                 }
 
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
-                    closeTransport()
-                    selectedDevice = null
+
+                    val detached =
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            intent.getParcelableExtra(
+                                UsbManager.EXTRA_DEVICE,
+                                UsbDevice::class.java
+                            )
+                        } else {
+                            @Suppress("DEPRECATION")
+                            intent.getParcelableExtra(
+                                UsbManager.EXTRA_DEVICE
+                            )
+                        }
+
+                    if (
+                        detached == null ||
+                        detached.deviceId == selectedDevice?.deviceId
+                    ) {
+                        closeTransport()
+                        selectedDevice = null
+                    }
+
                     status.value = "USB device detached"
                     refreshDevices()
                 }
             }
         }
     }
+
+    // ---------------------------------------------------------
+    // IPA FILE PICKER
+    // ---------------------------------------------------------
 
     private val ipaPicker =
         registerForActivityResult(
@@ -129,6 +161,10 @@ class MainActivity : ComponentActivity() {
                 inspectIpa(uri)
             }
         }
+
+    // ---------------------------------------------------------
+    // ACTIVITY CREATION
+    // ---------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -149,25 +185,35 @@ class MainActivity : ComponentActivity() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
 
+        receiverRegistered = true
+
         refreshDevices()
 
         setContent {
+
             MaterialTheme(
                 colorScheme = darkColorScheme()
             ) {
+
                 Surface(
                     modifier = Modifier.fillMaxSize()
                 ) {
+
                     Dashboard(
                         devices = usbDevices.toList(),
                         status = status.value,
                         transportInfo = transportInfo.value,
                         ipaInfo = ipaInfo.value,
                         operationStatus = operationStatus.value,
+
                         onScan = ::refreshDevices,
+
                         onRequestPermission = ::requestUsbPermission,
+
                         onProbe = ::probeUsbTransport,
+
                         onCloseTransport = ::closeTransport,
+
                         onChooseIpa = {
                             ipaPicker.launch(
                                 arrayOf(
@@ -189,12 +235,11 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshDevices() {
 
-        usbDevices.clear()
-
         val found = usbManager.deviceList.values.filter {
             it.vendorId == APPLE_VENDOR_ID
         }
 
+        usbDevices.clear()
         usbDevices.addAll(found)
 
         if (found.isEmpty()) {
@@ -207,9 +252,6 @@ class MainActivity : ComponentActivity() {
 
         } else {
 
-            status.value =
-                "${found.size} Apple USB device(s) detected. Detection does not mean paired."
-
             if (
                 selectedDevice == null ||
                 found.none {
@@ -218,6 +260,9 @@ class MainActivity : ComponentActivity() {
             ) {
                 selectedDevice = found.first()
             }
+
+            status.value =
+                "${found.size} Apple USB device(s) detected. Detection does not mean paired."
         }
     }
 
@@ -228,6 +273,11 @@ class MainActivity : ComponentActivity() {
     private fun requestUsbPermission(device: UsbDevice) {
 
         selectedDevice = device
+
+        if (usbManager.hasPermission(device)) {
+            status.value = "USB permission already granted."
+            return
+        }
 
         val intent = Intent(permissionAction)
             .setPackage(packageName)
@@ -246,13 +296,13 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------------------------------------------------------
-    // USB INTERFACE DIAGNOSTICS
+    // USBMUX INTERFACE DIAGNOSTICS
     // ---------------------------------------------------------
 
     private fun probeUsbTransport() {
 
         val device = selectedDevice ?: run {
-            status.value = "No Apple device selected"
+            status.value = "No Apple device selected."
             return
         }
 
@@ -263,7 +313,7 @@ class MainActivity : ComponentActivity() {
 
         closeTransport()
 
-        status.value = "Inspecting USB interfaces..."
+        status.value = "Inspecting Apple usbmux interface..."
 
         lifecycleScope.launch {
 
@@ -280,6 +330,7 @@ class MainActivity : ComponentActivity() {
                     val report = StringBuilder()
 
                     report.appendLine("USB DEVICE DIAGNOSTICS")
+
                     report.appendLine(
                         "Product: ${device.productName ?: "Apple device"}"
                     )
@@ -301,12 +352,18 @@ class MainActivity : ComponentActivity() {
 
                     report.appendLine()
 
+                    // Show all detected interfaces.
+
                     report.appendLine("INTERFACE DESCRIPTORS")
 
-                    interfaces.forEach { info ->
+                    interfaces.forEachIndexed { index, info ->
 
                         report.appendLine(
-                            "Interface ${info.interfaceNumber}"
+                            "Descriptor entry: $index"
+                        )
+
+                        report.appendLine(
+                            "Interface number: ${info.interfaceNumber}"
                         )
 
                         report.appendLine(
@@ -338,16 +395,33 @@ class MainActivity : ComponentActivity() {
                         )
 
                         report.appendLine(
-                            "Likely usbmux descriptor: ${info.isLikelyUsbmux}"
+                            "Likely usbmux: ${info.isLikelyUsbmux}"
                         )
 
                         report.appendLine()
                     }
 
-                    if (candidates.isEmpty()) {
+                    // Strictly filter Apple usbmux candidates.
+
+                    val usbmuxCandidates =
+                        candidates.filter { it.isLikelyUsbmux }
+
+                    report.appendLine("APPLE USBMUX TEST")
+
+                    report.appendLine(
+                        "Expected descriptor: FF/FE/02"
+                    )
+
+                    report.appendLine(
+                        "Matching candidates: ${usbmuxCandidates.size}"
+                    )
+
+                    report.appendLine()
+
+                    if (usbmuxCandidates.isEmpty()) {
 
                         report.appendLine(
-                            "RESULT: No interfaces with both bulk IN and OUT endpoints."
+                            "RESULT: No Apple usbmux interface with bulk IN and OUT endpoints."
                         )
 
                         return@withContext Pair(
@@ -356,118 +430,123 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    report.appendLine("INTERFACE CLAIM TESTS")
+                    report.appendLine(
+                        "Only matching Apple usbmux interfaces will be attempted."
+                    )
 
-                    var openedTransport: AppleUsbTransport? = null
+                    report.appendLine(
+                        "Generic interfaces will NOT be used as fallback."
+                    )
 
-                    candidates.forEachIndexed { index, candidate ->
+                    report.appendLine()
 
-                        if (openedTransport != null) {
-                            return@forEachIndexed
-                        }
+                    try {
+
+                        // IMPORTANT:
+                        // This method only attempts FF/FE/02.
+                        // It does not fall back to interface 0.
+
+                        val opened =
+                            AppleUsbTransport.openUsbmux(
+                                manager = usbManager,
+                                device = device
+                            )
 
                         report.appendLine(
-                            "Trying interface ${candidate.usbInterface.id} " +
-                                "(candidate $index)"
+                            "USBMUX INTERFACE CLAIM: SUCCESS"
                         )
 
-                        try {
+                        report.appendLine(
+                            "Interface: ${opened.details.interfaceNumber}"
+                        )
 
-                            val opened = AppleUsbTransport.open(
-                                manager = usbManager,
-                                device = device,
-                                candidateIndex = index,
-                                allowUnverifiedInterface = true
+                        report.appendLine(
+                            "Alternate setting: ${opened.details.alternateSetting}"
+                        )
+
+                        report.appendLine(
+                            "Class/Subclass/Protocol: %02X/%02X/%02X".format(
+                                opened.details.interfaceClass,
+                                opened.details.interfaceSubclass,
+                                opened.details.interfaceProtocol
                             )
+                        )
 
-                            openedTransport = opened
-
-                            report.appendLine("CLAIM: SUCCESS")
-
-                            report.appendLine(
-                                "Interface: ${opened.details.interfaceNumber}"
+                        report.appendLine(
+                            "Bulk IN: 0x%02X (packet %d)".format(
+                                opened.details.inputEndpoint,
+                                opened.details.inputMaxPacket
                             )
+                        )
 
-                            report.appendLine(
-                                "Class/Subclass/Protocol: %02X/%02X/%02X".format(
-                                    opened.details.interfaceClass,
-                                    opened.details.interfaceSubclass,
-                                    opened.details.interfaceProtocol
-                                )
+                        report.appendLine(
+                            "Bulk OUT: 0x%02X (packet %d)".format(
+                                opened.details.outputEndpoint,
+                                opened.details.outputMaxPacket
                             )
-
-                            report.appendLine(
-                                "Bulk IN: 0x%02X (packet %d)".format(
-                                    opened.details.inputEndpoint,
-                                    opened.details.inputMaxPacket
-                                )
-                            )
-
-                            report.appendLine(
-                                "Bulk OUT: 0x%02X (packet %d)".format(
-                                    opened.details.outputEndpoint,
-                                    opened.details.outputMaxPacket
-                                )
-                            )
-
-                            report.appendLine(
-                                "Likely usbmux: ${opened.isLikelyUsbmux}"
-                            )
-
-                        } catch (e: Exception) {
-
-                            report.appendLine(
-                                "CLAIM: FAILED - ${
-                                    e.message ?: e.javaClass.simpleName
-                                }"
-                            )
-                        }
+                        )
 
                         report.appendLine()
-                    }
-
-                    if (openedTransport == null) {
 
                         report.appendLine(
-                            "RESULT: Android could not claim any tested interface."
-                        )
-
-                    } else {
-
-                        report.appendLine(
-                            "RESULT: USB interface successfully claimed."
+                            "USBMUX INTERFACE CLAIMED."
                         )
 
                         report.appendLine(
                             "Apple usbmux handshake is NOT implemented."
                         )
-                    }
 
-                    Pair(
-                        openedTransport,
-                        report.toString()
-                    )
+                        Pair(
+                            opened,
+                            report.toString()
+                        )
+
+                    } catch (e: Exception) {
+
+                        report.appendLine(
+                            "USBMUX INTERFACE CLAIM: FAILED"
+                        )
+
+                        report.appendLine(
+                            e.message ?: e.javaClass.simpleName
+                        )
+
+                        report.appendLine()
+
+                        report.appendLine(
+                            "No fallback to interface 0 was attempted."
+                        )
+
+                        Pair(
+                            null,
+                            report.toString()
+                        )
+                    }
                 }
 
-                // Update app state on the main thread.
+                // Return to the main thread before changing UI state.
+
                 transport = result.first
+
                 transportInfo.value = result.second
 
                 status.value =
                     if (result.first != null) {
-                        "USB interface opened. Apple protocol session not established."
+                        "Apple usbmux USB interface claimed. Protocol session not established."
                     } else {
-                        "USB interface claim failed. See diagnostic report."
+                        "Apple usbmux interface claim failed. See diagnostic report."
                     }
 
             } catch (t: Exception) {
+
+                transport = null
 
                 transportInfo.value =
                     "USB diagnostic failed: ${
                         t.message ?: t.javaClass.simpleName
                     }"
 
-                status.value = "USB diagnostic failed"
+                status.value = "USB diagnostic failed."
             }
         }
     }
@@ -483,6 +562,7 @@ class MainActivity : ComponentActivity() {
         }
 
         transport = null
+
         transportInfo.value = "USB transport is closed"
     }
 
@@ -499,6 +579,7 @@ class MainActivity : ComponentActivity() {
             try {
 
                 val result = withContext(Dispatchers.IO) {
+
                     IpaInspector.inspect(
                         contentResolver,
                         uri,
@@ -506,7 +587,11 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
+                // Remove the previous staged copy only after
+                // the new IPA has been successfully inspected.
+
                 stagedIpa?.stagedFile?.delete()
+
                 stagedIpa = result
 
                 ipaInfo.value = buildString {
@@ -559,13 +644,24 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ---------------------------------------------------------
+    // ACTIVITY DESTRUCTION
+    // ---------------------------------------------------------
+
     override fun onDestroy() {
 
         closeTransport()
 
         stagedIpa?.stagedFile?.delete()
+        stagedIpa = null
 
-        unregisterReceiver(usbReceiver)
+        if (receiverRegistered) {
+            runCatching {
+                unregisterReceiver(usbReceiver)
+            }
+
+            receiverRegistered = false
+        }
 
         super.onDestroy()
     }
@@ -716,7 +812,9 @@ private fun Dashboard(
             StatusLine("Android USB enumeration", true)
             StatusLine("Android USB permission", true)
             StatusLine("USB bulk endpoint diagnostics", true)
-            StatusLine("usbmux / Lockdown pairing", false)
+            StatusLine("Apple usbmux interface selection", true)
+            StatusLine("Apple usbmux protocol handshake", false)
+            StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
             StatusLine("Apple ID / Anisette authentication", false)
@@ -726,7 +824,7 @@ private fun Dashboard(
         }
 
         Text(
-            "This development build does not yet pair, sign, or install applications. USB endpoint probing is diagnostic only.",
+            "This development build does not yet pair, sign, or install applications. USB interface probing is diagnostic only.",
             style = MaterialTheme.typography.bodySmall
         )
     }
