@@ -1,4 +1,3 @@
-
 package com.impactor.android
 
 import android.app.PendingIntent
@@ -54,6 +53,7 @@ class MainActivity : ComponentActivity() {
     private val transportInfo = mutableStateOf("USB transport is closed")
     private val usbmuxInfo = mutableStateOf("USBMUX handshake has not been tested.")
     private val lockdownInfo = mutableStateOf("Lockdown protocol exchange has not been tested.")
+    private val deviceInfo = mutableStateOf("No device information retrieved yet.")
     private val ipaInfo = mutableStateOf("No IPA selected")
     private val operationStatus = mutableStateOf("No installation operation has been run")
     private val diagnosticReport = mutableStateOf("")
@@ -196,6 +196,7 @@ class MainActivity : ComponentActivity() {
                         transportInfo = transportInfo.value,
                         usbmuxInfo = usbmuxInfo.value,
                         lockdownInfo = lockdownInfo.value,
+                        deviceInfo = deviceInfo.value,
                         ipaInfo = ipaInfo.value,
                         operationStatus = operationStatus.value,
                         hasDiagnosticReport = diagnosticReport.value.isNotBlank(),
@@ -204,6 +205,7 @@ class MainActivity : ComponentActivity() {
                         onProbe = ::probeUsbTransport,
                         onUsbMuxHandshake = ::testUsbMuxHandshake,
                         onConnectLockdown = ::connectLockdown,
+                        onGetDeviceInformation = ::getDeviceInformation,
                         onCloseTransport = ::closeTransport,
                         onCopyDiagnostics = {
                             copyToClipboard(
@@ -626,7 +628,6 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // FIX: Preserve and display the raw TCP/USBMUX diagnostic data.
                 if (!sendResult.success) {
                     val report = buildString {
                         appendLine("LOCKDOWN TCP DATA TRANSMISSION FAILED")
@@ -653,7 +654,6 @@ class MainActivity : ComponentActivity() {
                     lockdownInfo.value = report
                     diagnosticReport.value += "\n\n$report"
 
-                    // Do not reuse a connection that has failed during transmission.
                     runCatching {
                         withContext(Dispatchers.IO) {
                             connection.close()
@@ -744,6 +744,165 @@ class MainActivity : ComponentActivity() {
                 lockdownTestRunning = false
             }
         }
+    }
+
+    // ---------------------------------------------------------
+    // LOCKDOWN GETVALUE - DEVICE INFORMATION
+    // ---------------------------------------------------------
+
+    private fun getDeviceInformation() {
+        val connection = lockdownTcp
+
+        if (connection == null || !connection.isConnected) {
+            status.value =
+                "Run the Lockdown QueryType test first to establish a connection."
+            return
+        }
+
+        if (lockdownTestRunning) {
+            status.value = "Another Lockdown operation is running."
+            return
+        }
+
+        lockdownTestRunning = true
+        deviceInfo.value = "Retrieving iPad information..."
+        status.value = "Sending Lockdown GetValue requests..."
+
+        lifecycleScope.launch {
+            val requestedKeys = listOf(
+                "DeviceName",
+                "ProductType",
+                "ProductVersion",
+                "BuildVersion",
+                "ModelNumber",
+                "DeviceClass"
+            )
+
+            val results = linkedMapOf<String, String>()
+
+            try {
+                for (key in requestedKeys) {
+                    val request = """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                        <plist version="1.0">
+                        <dict>
+                            <key>Label</key>
+                            <string>Impactor Android</string>
+                            <key>Request</key>
+                            <string>GetValue</string>
+                            <key>Key</key>
+                            <string>$key</string>
+                        </dict>
+                        </plist>
+                    """.trimIndent()
+
+                    val response = withContext(Dispatchers.IO) {
+                        val sendResult = connection.sendData(
+                            data = createLockdownFrame(request),
+                            timeoutMs = 7000
+                        )
+
+                        if (!sendResult.success) {
+                            throw IllegalStateException(
+                                "GetValue send failed for $key: ${sendResult.message}"
+                            )
+                        }
+
+                        receiveLockdownFrame(
+                            connection = connection,
+                            timeoutMs = 10000
+                        )
+                    }
+
+                    val responseText = response.toString(Charsets.UTF_8)
+                    results[key] = extractGetValue(responseText)
+                }
+
+                val report = buildString {
+                    appendLine("APPLE LOCKDOWN GETVALUE TEST")
+                    appendLine("Date: ${java.util.Date()}")
+                    appendLine("Connection: Existing Lockdown TCP session")
+                    appendLine()
+                    appendLine("DEVICE INFORMATION")
+                    appendLine()
+
+                    results.forEach { (key, value) ->
+                        appendLine("$key: $value")
+                    }
+                }
+
+                deviceInfo.value = report
+                diagnosticReport.value += "\n\n$report"
+                status.value =
+                    "Lockdown GetValue requests completed. Check the device information."
+
+            } catch (e: Exception) {
+                val error = buildString {
+                    appendLine("LOCKDOWN GETVALUE FAILED")
+                    appendLine("Date: ${java.util.Date()}")
+                    appendLine()
+                    appendLine("${e.javaClass.simpleName}: ${e.message}")
+                    appendLine()
+                    appendLine("Values received before failure:")
+
+                    results.forEach { (key, value) ->
+                        appendLine("$key: $value")
+                    }
+                }
+
+                deviceInfo.value = error
+                diagnosticReport.value += "\n\n$error"
+                status.value = "GetValue failed. Copy diagnostics for inspection."
+
+                if (!connection.isConnected) {
+                    runCatching {
+                        withContext(Dispatchers.IO) {
+                            connection.close()
+                        }
+                    }
+                    lockdownTcp = null
+                }
+            } finally {
+                lockdownTestRunning = false
+            }
+        }
+    }
+
+    private fun extractGetValue(xml: String): String {
+        val errorMatch = Regex(
+            """<key>\s*Error\s*</key>\s*<string>(.*?)</string>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(xml)
+
+        if (errorMatch != null) {
+            return "Unavailable: ${decodeXml(errorMatch.groupValues[1])}"
+        }
+
+        val valueMatch = Regex(
+            """<key>\s*Value\s*</key>\s*<(string|integer)>(.*?)</\1>""",
+            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
+        ).find(xml)
+
+        if (valueMatch != null) {
+            val value = valueMatch.groupValues[2].trim()
+            return decodeXml(value).ifBlank { "Empty value" }
+        }
+
+        if (Regex("""<key>\s*Value\s*</key>""").containsMatchIn(xml)) {
+            return "Value returned in an unsupported plist format."
+        }
+
+        return "No Value field returned."
+    }
+
+    private fun decodeXml(value: String): String {
+        return value
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&amp;", "&")
     }
 
     // ---------------------------------------------------------
@@ -855,6 +1014,7 @@ class MainActivity : ComponentActivity() {
         transportInfo.value = "USB transport is closed"
         usbmuxInfo.value = "USBMUX handshake has not been tested."
         lockdownInfo.value = "Lockdown protocol exchange has not been tested."
+        deviceInfo.value = "No device information retrieved yet."
     }
 
     // ---------------------------------------------------------
@@ -944,6 +1104,7 @@ private fun Dashboard(
     transportInfo: String,
     usbmuxInfo: String,
     lockdownInfo: String,
+    deviceInfo: String,
     ipaInfo: String,
     operationStatus: String,
     hasDiagnosticReport: Boolean,
@@ -952,6 +1113,7 @@ private fun Dashboard(
     onProbe: () -> Unit,
     onUsbMuxHandshake: () -> Unit,
     onConnectLockdown: () -> Unit,
+    onGetDeviceInformation: () -> Unit,
     onCloseTransport: () -> Unit,
     onCopyDiagnostics: () -> Unit,
     onCopyIpa: () -> Unit,
@@ -1013,6 +1175,15 @@ private fun Dashboard(
             }
 
             Text(lockdownInfo, style = MaterialTheme.typography.bodySmall)
+
+            Button(
+                onClick = onGetDeviceInformation,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Get Device Information")
+            }
+
+            Text(deviceInfo, style = MaterialTheme.typography.bodySmall)
         }
 
         SectionCard("APPLE DEVICES") {
@@ -1084,8 +1255,9 @@ private fun Dashboard(
             StatusLine("Apple usbmux interface selection", true)
             StatusLine("USBMUX version negotiation", true)
             StatusLine("USBMUX2 setup packet transmission", true)
-            StatusLine("USBMUX2 TCP handshake", false)
-            StatusLine("Lockdown QueryType exchange", false)
+            StatusLine("USBMUX2 TCP handshake", true)
+            StatusLine("Lockdown QueryType exchange", true)
+            StatusLine("Lockdown GetValue requests", false)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
@@ -1096,7 +1268,7 @@ private fun Dashboard(
         }
 
         Text(
-            "This development build does not yet pair, sign, or install applications. USB interface probing and USBMUX protocol tests are diagnostic only.",
+            "This development build can test USBMUX and basic Lockdown requests. Pairing, signing, and IPA installation are not implemented.",
             style = MaterialTheme.typography.bodySmall
         )
     }
