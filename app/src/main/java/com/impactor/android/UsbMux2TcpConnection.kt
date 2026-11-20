@@ -8,6 +8,7 @@ import android.os.SystemClock
  *
  * Implements:
  * - USBMUX2 extended packet headers
+ * - Directional USBMUX2 magic values
  * - USBMUX sequence tracking
  * - TCP SYN / SYN-ACK / ACK handshake
  * - Raw USB response diagnostics
@@ -39,13 +40,16 @@ class UsbMux2TcpConnection(
         private const val MIN_PACKET_SIZE =
             MUX_HEADER_SIZE + TCP_HEADER_SIZE
 
-        private const val MUX_MAGIC = 0xFEEDFACEL
+        // USBMUX2 magic values are directional.
+        private const val MUX_MAGIC_OUT = 0xFEEDFACEL
+        private const val MUX_MAGIC_IN = 0xFACEFACEL
 
         private const val TCP_SYN = 0x02
         private const val TCP_ACK = 0x10
         private const val TCP_RST = 0x04
 
         private const val TCP_WINDOW = 512
+
         private const val MAX_PACKET_SIZE = 16 * 1024
         private const val MAX_DIAGNOSTIC_BYTES = 256
     }
@@ -58,7 +62,6 @@ class UsbMux2TcpConnection(
 
     private var receiveBuffer = ByteArray(0)
 
-    // Preserve bytes even when packet parsing fails.
     private var lastReceivedPacket = ByteArray(0)
     private var lastReceivedBytes = ByteArray(0)
 
@@ -137,24 +140,38 @@ class UsbMux2TcpConnection(
                 val remoteAcknowledgement =
                     readUInt32BE(packet, tcpOffset + 8)
 
+                val dataOffsetByte =
+                    packet[tcpOffset + 12].toInt() and 0xFF
+
                 val dataOffset =
-                    ((packet[tcpOffset + 12].toInt() and 0xFF) ushr 4) * 4
+                    ((dataOffsetByte ushr 4) and 0x0F) * 4
 
                 val flags =
                     packet[tcpOffset + 13].toInt() and 0xFF
 
-                if (
-                    dataOffset < TCP_HEADER_SIZE ||
-                    packet.size < MUX_HEADER_SIZE + dataOffset
-                ) {
-                    continue
-                }
-
+                // Check ports before processing this TCP packet.
                 if (
                     sourcePort != remotePort ||
                     destinationPort != localPort
                 ) {
                     continue
+                }
+
+                // Preserve malformed TCP header details for diagnostics.
+                if (
+                    dataOffset < TCP_HEADER_SIZE ||
+                    packet.size < MUX_HEADER_SIZE + dataOffset
+                ) {
+                    return result(
+                        false,
+                        "Invalid TCP header received. " +
+                            "Data offset=$dataOffsetByte " +
+                            "(decoded size=$dataOffset bytes), " +
+                            "flags=0x${flags.toString(16)}. " +
+                            "The USBMUX2 frame was received, " +
+                            "but its TCP header could not be validated.",
+                        packet.toHex()
+                    )
                 }
 
                 if ((flags and TCP_RST) != 0) {
@@ -175,7 +192,10 @@ class UsbMux2TcpConnection(
                 val expectedAcknowledgement =
                     (tcpTxSequence + 1) and 0xFFFFFFFFL
 
-                if (remoteAcknowledgement != expectedAcknowledgement) {
+                if (
+                    remoteAcknowledgement !=
+                    expectedAcknowledgement
+                ) {
                     return result(
                         false,
                         "Invalid SYN-ACK acknowledgement. " +
@@ -255,7 +275,9 @@ class UsbMux2TcpConnection(
 
         putUInt32BE(packet, 0, PROTOCOL_TCP)
         putUInt32BE(packet, 4, packet.size.toLong())
-        putUInt32BE(packet, 8, MUX_MAGIC)
+
+        // Outgoing Android -> Apple magic.
+        putUInt32BE(packet, 8, MUX_MAGIC_OUT)
 
         putUInt16BE(packet, 12, muxTxSequence)
         putUInt16BE(packet, 14, muxRxSequence)
@@ -293,7 +315,8 @@ class UsbMux2TcpConnection(
                     packetLengthLong > MAX_PACKET_SIZE.toLong()
                 ) {
                     throw IllegalStateException(
-                        "Invalid USBMUX2 packet length: $packetLengthLong. " +
+                        "Invalid USBMUX2 packet length: " +
+                            "$packetLengthLong. " +
                             "Received bytes: ${receiveBuffer.toHex()}"
                     )
                 }
@@ -371,12 +394,17 @@ class UsbMux2TcpConnection(
                 "Raw: ${packet.toHex()}"
         }
 
-        check(magic == MUX_MAGIC) {
-            "Invalid USBMUX2 magic value. " +
+        check(protocol == PROTOCOL_TCP) {
+            "Unexpected USBMUX2 protocol: $protocol."
+        }
+
+        // Incoming Apple -> Android magic.
+        check(magic == MUX_MAGIC_IN) {
+            "Invalid incoming USBMUX2 magic value. " +
                 "Protocol=0x${protocol.toString(16)} " +
                 "Length=$length " +
                 "Magic=0x${magic.toString(16)} " +
-                "Expected=0x${MUX_MAGIC.toString(16)} " +
+                "Expected=0x${MUX_MAGIC_IN.toString(16)} " +
                 "Raw: ${packet.toHex()}"
         }
     }
@@ -400,7 +428,10 @@ class UsbMux2TcpConnection(
         }
     }
 
-    private fun ByteArray.takeLastBytes(maxBytes: Int): ByteArray {
+    private fun ByteArray.takeLastBytes(
+        maxBytes: Int
+    ): ByteArray {
+
         if (size <= maxBytes) return copyOf()
 
         return copyOfRange(
