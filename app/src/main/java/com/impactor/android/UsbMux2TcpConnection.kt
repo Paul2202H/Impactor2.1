@@ -7,18 +7,24 @@ import android.os.SystemClock
  * USBMUX2 pseudo-TCP connection.
  *
  * Implements:
- * - USBMUX2 extended packet headers
+ * - USBMUX2 extended packet framing
  * - Directional USBMUX2 magic values
- * - USBMUX sequence tracking
- * - TCP SYN / SYN-ACK / ACK validation
- * - TCP reserved-bit validation
- * - TCP NS flag diagnostics
- * - Indexed raw USB response diagnostics
+ * - USBMUX2 transmit/receive sequence tracking
+ * - TCP SYN / SYN-ACK / ACK handshake
+ * - TCP header validation
+ * - 32-bit wraparound-safe ACK validation
+ * - TCP payload transmission and reception
+ * - Receive-window handling, including zero windows
+ * - Incoming payload buffering
+ * - Basic FIN/RST handling
  * - Fragmented USB packet buffering
  *
- * Not yet implemented:
- * - TCP payload transmission
- * - TCP flow control and retransmission
+ * Not implemented:
+ * - TCP retransmission
+ * - Out-of-order payload buffering
+ * - TCP window scaling
+ * - Zero-window probing
+ * - Full TCP recovery/state machine
  * - Lockdown protocol
  * - Apple pairing
  */
@@ -36,6 +42,27 @@ class UsbMux2TcpConnection(
         val rawResponse: String = ""
     )
 
+    data class TransferResult(
+        val success: Boolean,
+        val message: String,
+        val bytesTransferred: Int = 0,
+        val rawResponse: String = ""
+    )
+
+    data class ReceiveResult(
+        val success: Boolean,
+        val message: String,
+        val data: ByteArray = ByteArray(0)
+    )
+
+    private data class TcpPacket(
+        val sequence: Long,
+        val acknowledgement: Long,
+        val flags: Int,
+        val window: Int,
+        val payload: ByteArray
+    )
+
     companion object {
 
         private const val PROTOCOL_TCP = 6L
@@ -43,10 +70,8 @@ class UsbMux2TcpConnection(
         private const val MUX_HEADER_SIZE = 16
         private const val TCP_HEADER_SIZE = 20
 
-        private const val MIN_MUX_PACKET_SIZE = MUX_HEADER_SIZE
-
-        private const val MIN_TCP_PACKET_SIZE =
-            MUX_HEADER_SIZE + TCP_HEADER_SIZE
+        private const val MIN_MUX_PACKET_SIZE = 16
+        private const val MIN_TCP_PACKET_SIZE = 36
 
         private const val MUX_MAGIC_OUT = 0xFEEDFACEL
         private const val MUX_MAGIC_IN = 0xFACEFACEL
@@ -57,10 +82,6 @@ class UsbMux2TcpConnection(
         private const val TCP_PSH = 0x08
         private const val TCP_ACK = 0x10
 
-        // TCP byte 12:
-        // Bits 7-4: Data offset
-        // Bits 3-1: Reserved
-        // Bit 0: NS flag
         private const val TCP_RESERVED_MASK = 0x0E
         private const val TCP_NS_MASK = 0x01
 
@@ -69,22 +90,46 @@ class UsbMux2TcpConnection(
         private const val MAX_PACKET_SIZE = 16 * 1024
         private const val MAX_BUFFER_SIZE = MAX_PACKET_SIZE * 2
         private const val MAX_DIAGNOSTIC_BYTES = 256
+
+        private const val MAX_TCP_PAYLOAD = 512
+
+        private const val SEQUENCE_MASK = 0xFFFFFFFFL
+        private const val SEQUENCE_HALF = 0x80000000L
     }
 
+    // USBMUX2 sequence numbers.
     private var muxTxSequence = 1
     private var muxRxSequence = 0xFFFF
 
+    // TCP sequence numbers.
     private var tcpTxSequence = 0L
+    private var tcpTxAcknowledged = 0L
     private var tcpRxAcknowledgement = 0L
 
+    // Exact peer-advertised receive window.
+    private var peerWindow = TCP_WINDOW
+
+    // USB receive buffering.
     private var receiveBuffer = ByteArray(0)
 
+    // Application payload waiting to be read.
+    private var pendingReceivedData = ByteArray(0)
+
+    // Diagnostics.
     private var lastReceivedPacket = ByteArray(0)
     private var lastReceivedBytes = ByteArray(0)
 
     @Volatile
     var isConnected = false
         private set
+
+    @Volatile
+    var isRemoteClosed = false
+        private set
+
+    // ---------------------------------------------------------
+    // CONNECTION
+    // ---------------------------------------------------------
 
     @Synchronized
     fun connect(timeoutMs: Int = 7000): ConnectResult {
@@ -104,7 +149,6 @@ class UsbMux2TcpConnection(
 
         try {
 
-            // Step 1: Send TCP SYN.
             sendTcpPacket(
                 flags = TCP_SYN,
                 sequence = tcpTxSequence,
@@ -119,163 +163,73 @@ class UsbMux2TcpConnection(
                 val packet = readMuxPacket(deadline)
                     ?: continue
 
-                lastReceivedPacket = packet.copyOf()
-
-                if (packet.size < MIN_MUX_PACKET_SIZE) {
+                if (readUInt32BE(packet, 0) != PROTOCOL_TCP) {
                     continue
                 }
 
-                val protocol = readUInt32BE(packet, 0)
+                val tcp = parseTcpPacket(packet)
+                    ?: continue
 
-                // Ignore non-TCP USBMUX2 packets.
-                if (protocol != PROTOCOL_TCP) {
-                    continue
-                }
-
-                validateMuxHeader(packet)
-
-                if (packet.size < MIN_TCP_PACKET_SIZE) {
+                if ((tcp.flags and TCP_RST) != 0) {
                     return failure(
-                        "TCP packet is shorter than the minimum " +
-                            "20-byte TCP header.",
+                        "The Apple device rejected the connection.",
                         packet
                     )
                 }
 
-                // Update incoming USBMUX2 sequence.
-                muxRxSequence = readUInt16BE(packet, 14)
+                val hasSyn =
+                    (tcp.flags and TCP_SYN) != 0
 
-                val tcpOffset = MUX_HEADER_SIZE
+                val hasAck =
+                    (tcp.flags and TCP_ACK) != 0
 
-                val sourcePort =
-                    readUInt16BE(packet, tcpOffset)
-
-                val destinationPort =
-                    readUInt16BE(packet, tcpOffset + 2)
-
-                // Ignore unrelated TCP connections.
-                if (
-                    sourcePort != remotePort ||
-                    destinationPort != localPort
-                ) {
-                    continue
-                }
-
-                val remoteSequence =
-                    readUInt32BE(packet, tcpOffset + 4)
-
-                val remoteAcknowledgement =
-                    readUInt32BE(packet, tcpOffset + 8)
-
-                val dataOffsetByte =
-                    packet[tcpOffset + 12].toInt() and 0xFF
-
-                val dataOffset =
-                    ((dataOffsetByte ushr 4) and 0x0F) * 4
-
-                val flags =
-                    packet[tcpOffset + 13].toInt() and 0xFF
-
-                // Extract TCP reserved bits separately from NS.
-                val reservedBits =
-                    dataOffsetByte and TCP_RESERVED_MASK
-
-                val nsFlag =
-                    (dataOffsetByte and TCP_NS_MASK) != 0
-
-                // Step 2: Validate TCP header length.
-                if (
-                    dataOffset < TCP_HEADER_SIZE ||
-                    dataOffset > 60 ||
-                    packet.size < tcpOffset + dataOffset
-                ) {
-                    return failure(
-                        "Invalid TCP header length. " +
-                            "Data-offset byte=0x${hexByte(dataOffsetByte)}, " +
-                            "decoded size=$dataOffset bytes. " +
-                            "Flags=0x${hexByte(flags)}.",
-                        packet
-                    )
-                }
-
-                // Step 3: Reject nonzero reserved bits.
-                if (reservedBits != 0) {
-                    return failure(
-                        "Invalid TCP reserved bits. " +
-                            "Data-offset byte=0x${hexByte(dataOffsetByte)}. " +
-                            "Reserved bits=0x${hexByte(reservedBits)}. " +
-                            "NS flag=$nsFlag. " +
-                            "Expected reserved bits to be zero. " +
-                            "The TCP handshake was not completed.",
-                        packet
-                    )
-                }
-
-                // Step 4: Check TCP reset.
-                if ((flags and TCP_RST) != 0) {
-                    return failure(
-                        "The Apple device rejected the connection " +
-                            "with TCP RST. " +
-                            "Flags=0x${hexByte(flags)}.",
-                        packet
-                    )
-                }
-
-                val hasSyn = (flags and TCP_SYN) != 0
-                val hasAck = (flags and TCP_ACK) != 0
-
-                // Step 5: Require SYN + ACK.
                 if (!hasSyn || !hasAck) {
                     continue
                 }
 
-                // Step 6: Validate acknowledgement.
-                val expectedAcknowledgement =
-                    (tcpTxSequence + 1) and 0xFFFFFFFFL
+                val expectedAck =
+                    addSequence(tcpTxSequence, 1)
 
-                if (
-                    remoteAcknowledgement !=
-                    expectedAcknowledgement
-                ) {
+                if (tcp.acknowledgement != expectedAck) {
                     return failure(
                         "Invalid SYN-ACK acknowledgement. " +
-                            "Expected=$expectedAcknowledgement, " +
-                            "Received=$remoteAcknowledgement. " +
-                            "The TCP handshake was not completed.",
+                            "Expected=$expectedAck, " +
+                            "Received=${tcp.acknowledgement}.",
                         packet
                     )
                 }
 
-                // Step 7: Accept remote SYN sequence.
-                tcpTxSequence = expectedAcknowledgement
+                // Our SYN has been acknowledged.
+                tcpTxSequence = expectedAck
+                tcpTxAcknowledged = expectedAck
 
+                // The remote SYN consumes one sequence number.
                 tcpRxAcknowledgement =
-                    (remoteSequence + 1) and 0xFFFFFFFFL
+                    addSequence(tcp.sequence, 1)
 
-                // Step 8: Send final TCP ACK.
+                peerWindow = tcp.window
+
+                // Complete the three-way handshake.
                 sendTcpPacket(
                     flags = TCP_ACK,
                     sequence = tcpTxSequence,
                     acknowledgement = tcpRxAcknowledgement
                 )
 
-                // Step 9: Mark connected after ACK write.
                 isConnected = true
 
                 return result(
                     true,
                     "USBMUX2 pseudo-TCP handshake completed. " +
                         "Connected to port $remotePort. " +
-                        "TCP NS flag=$nsFlag. " +
-                        "Lockdown communication is not implemented yet.",
+                        "Further data exchange still needs validation.",
                     indexedHex(packet)
                 )
             }
 
             return result(
                 false,
-                "Timed out waiting for a valid TCP SYN-ACK response. " +
-                    "The TCP handshake was not completed.",
+                "Timed out waiting for TCP SYN-ACK.",
                 diagnosticHex()
             )
 
@@ -285,36 +239,475 @@ class UsbMux2TcpConnection(
 
             return result(
                 false,
-                "USBMUX2 TCP connection failed: " +
+                "Connection failed: " +
                     "${error.javaClass.simpleName}: ${error.message}",
                 diagnosticHex()
             )
         }
     }
 
-    private fun resetConnectionState() {
+    // ---------------------------------------------------------
+    // SEND TCP DATA
+    // ---------------------------------------------------------
 
-        isConnected = false
+    @Synchronized
+    fun sendData(
+        data: ByteArray,
+        timeoutMs: Int = 5000
+    ): TransferResult {
 
-        receiveBuffer = ByteArray(0)
+        if (!isConnected) {
+            return transferFailure("TCP is not connected.")
+        }
 
-        lastReceivedPacket = ByteArray(0)
-        lastReceivedBytes = ByteArray(0)
+        if (isRemoteClosed) {
+            return transferFailure(
+                "The remote device closed the connection."
+            )
+        }
 
-        muxTxSequence = 1
-        muxRxSequence = 0xFFFF
+        if (data.isEmpty()) {
+            return TransferResult(
+                true,
+                "No data to send.",
+                0
+            )
+        }
 
-        tcpTxSequence = 0L
-        tcpRxAcknowledgement = 0L
+        require(timeoutMs > 0)
+
+        if (tcpTxSequence != tcpTxAcknowledged) {
+            return transferFailure(
+                "Previous TCP data is still unacknowledged. " +
+                    "Reconnect before sending more data."
+            )
+        }
+
+        val deadline =
+            SystemClock.elapsedRealtime() + timeoutMs
+
+        var totalSent = 0
+
+        try {
+
+            while (totalSent < data.size) {
+
+                // Wait for a non-zero peer receive window.
+                while (
+                    peerWindow == 0 &&
+                    SystemClock.elapsedRealtime() < deadline
+                ) {
+
+                    val packet = readMuxPacket(deadline)
+                        ?: continue
+
+                    processIncomingPacket(packet)
+                }
+
+                if (peerWindow == 0) {
+                    return TransferResult(
+                        false,
+                        "Peer receive window remained zero. " +
+                            "No additional data was sent.",
+                        totalSent,
+                        diagnosticHex()
+                    )
+                }
+
+                val chunkSize = minOf(
+                    MAX_TCP_PAYLOAD,
+                    peerWindow,
+                    data.size - totalSent
+                )
+
+                if (chunkSize <= 0) {
+                    return TransferResult(
+                        false,
+                        "No available TCP send window.",
+                        totalSent,
+                        diagnosticHex()
+                    )
+                }
+
+                val chunk = data.copyOfRange(
+                    totalSent,
+                    totalSent + chunkSize
+                )
+
+                val expectedAck =
+                    addSequence(tcpTxSequence, chunk.size.toLong())
+
+                sendTcpPacket(
+                    flags = TCP_ACK or TCP_PSH,
+                    sequence = tcpTxSequence,
+                    acknowledgement = tcpRxAcknowledgement,
+                    payload = chunk
+                )
+
+                // Record the end of transmitted data.
+                tcpTxSequence = expectedAck
+
+                // Wait until this segment is acknowledged.
+                while (
+                    tcpTxAcknowledged != expectedAck &&
+                    SystemClock.elapsedRealtime() < deadline
+                ) {
+
+                    val packet = readMuxPacket(deadline)
+                        ?: continue
+
+                    processIncomingPacket(packet)
+                }
+
+                if (tcpTxAcknowledged != expectedAck) {
+                    return TransferResult(
+                        false,
+                        "TCP acknowledgement timeout. " +
+                            "Expected ACK=$expectedAck, " +
+                            "Received ACK=$tcpTxAcknowledged. " +
+                            "Retransmission is not implemented.",
+                        totalSent,
+                        diagnosticHex()
+                    )
+                }
+
+                totalSent += chunkSize
+            }
+
+            return TransferResult(
+                true,
+                "TCP data acknowledged by the device.",
+                totalSent,
+                diagnosticHex()
+            )
+
+        } catch (error: Exception) {
+
+            return TransferResult(
+                false,
+                "TCP send failed: ${error.message}",
+                totalSent,
+                diagnosticHex()
+            )
+        }
     }
+
+    // ---------------------------------------------------------
+    // RECEIVE TCP DATA
+    // ---------------------------------------------------------
+
+    @Synchronized
+    fun receiveData(
+        maxBytes: Int = 4096,
+        timeoutMs: Int = 5000
+    ): ReceiveResult {
+
+        if (!isConnected) {
+            return ReceiveResult(
+                false,
+                "TCP is not connected."
+            )
+        }
+
+        require(maxBytes > 0)
+        require(timeoutMs > 0)
+
+        val deadline =
+            SystemClock.elapsedRealtime() + timeoutMs
+
+        try {
+
+            while (
+                pendingReceivedData.isEmpty() &&
+                SystemClock.elapsedRealtime() < deadline &&
+                !isRemoteClosed
+            ) {
+
+                val packet = readMuxPacket(deadline)
+                    ?: continue
+
+                processIncomingPacket(packet)
+            }
+
+            if (pendingReceivedData.isEmpty()) {
+                return ReceiveResult(
+                    true,
+                    if (isRemoteClosed) {
+                        "The remote device closed the connection."
+                    } else {
+                        "Receive timeout. No TCP payload received."
+                    }
+                )
+            }
+
+            val count = minOf(
+                maxBytes,
+                pendingReceivedData.size
+            )
+
+            val output = pendingReceivedData.copyOfRange(
+                0,
+                count
+            )
+
+            pendingReceivedData = pendingReceivedData.copyOfRange(
+                count,
+                pendingReceivedData.size
+            )
+
+            return ReceiveResult(
+                true,
+                "Received $count TCP payload bytes.",
+                output
+            )
+
+        } catch (error: Exception) {
+
+            return ReceiveResult(
+                false,
+                "TCP receive failed: ${error.message}"
+            )
+        }
+    }
+
+    // ---------------------------------------------------------
+    // INCOMING PACKET PROCESSING
+    // ---------------------------------------------------------
+
+    private fun processIncomingPacket(packet: ByteArray) {
+
+        if (packet.size < MIN_MUX_PACKET_SIZE) {
+            return
+        }
+
+        if (readUInt32BE(packet, 0) != PROTOCOL_TCP) {
+            return
+        }
+
+        val tcp = parseTcpPacket(packet)
+            ?: return
+
+        val flags = tcp.flags
+
+        if ((flags and TCP_RST) != 0) {
+            isConnected = false
+            isRemoteClosed = true
+
+            throw IllegalStateException(
+                "The Apple device sent TCP RST."
+            )
+        }
+
+        // Keep the exact advertised window.
+        peerWindow = tcp.window
+
+        // Validate and process the acknowledgement.
+        if ((flags and TCP_ACK) != 0) {
+            updateTcpAcknowledgement(
+                tcp.acknowledgement
+            )
+        }
+
+        var shouldSendAck = false
+
+        val payloadSize = tcp.payload.size
+
+        // Process payload only at the expected sequence.
+        if (payloadSize > 0) {
+
+            if (tcp.sequence == tcpRxAcknowledgement) {
+
+                pendingReceivedData += tcp.payload
+
+                tcpRxAcknowledgement =
+                    addSequence(
+                        tcpRxAcknowledgement,
+                        payloadSize.toLong()
+                    )
+
+                shouldSendAck = true
+
+            } else {
+
+                // Duplicate or out-of-order data.
+                // Do not append it. Acknowledge the next expected byte.
+                shouldSendAck = true
+            }
+        }
+
+        // FIN sequence comes after payload bytes.
+        if ((flags and TCP_FIN) != 0) {
+
+            val finSequence =
+                addSequence(
+                    tcp.sequence,
+                    payloadSize.toLong()
+                )
+
+            if (finSequence == tcpRxAcknowledgement) {
+
+                tcpRxAcknowledgement =
+                    addSequence(tcpRxAcknowledgement, 1)
+
+                isRemoteClosed = true
+                shouldSendAck = true
+
+            } else {
+                // FIN was not at the expected sequence.
+                shouldSendAck = true
+            }
+        }
+
+        if (shouldSendAck) {
+
+            sendTcpPacket(
+                flags = TCP_ACK,
+                sequence = tcpTxSequence,
+                acknowledgement = tcpRxAcknowledgement
+            )
+        }
+    }
+
+    // ---------------------------------------------------------
+    // TCP ACK TRACKING
+    // ---------------------------------------------------------
+
+    private fun updateTcpAcknowledgement(ack: Long) {
+
+        val outstanding =
+            sequenceDistance(
+                tcpTxAcknowledged,
+                tcpTxSequence
+            )
+
+        val advancement =
+            sequenceDistance(
+                tcpTxAcknowledged,
+                ack
+            )
+
+        // Ignore stale ACKs and ACKs beyond transmitted data.
+        if (
+            advancement <= outstanding &&
+            advancement < SEQUENCE_HALF
+        ) {
+            tcpTxAcknowledged = ack
+        }
+    }
+
+    // ---------------------------------------------------------
+    // TCP PACKET PARSER
+    // ---------------------------------------------------------
+
+    private fun parseTcpPacket(
+        packet: ByteArray
+    ): TcpPacket? {
+
+        validateMuxHeader(packet)
+
+        if (packet.size < MIN_TCP_PACKET_SIZE) {
+            return null
+        }
+
+        val offset = MUX_HEADER_SIZE
+
+        val sourcePort =
+            readUInt16BE(packet, offset)
+
+        val destinationPort =
+            readUInt16BE(packet, offset + 2)
+
+        if (
+            sourcePort != remotePort ||
+            destinationPort != localPort
+        ) {
+            return null
+        }
+
+        val sequence =
+            readUInt32BE(packet, offset + 4)
+
+        val acknowledgement =
+            readUInt32BE(packet, offset + 8)
+
+        val dataOffsetByte =
+            packet[offset + 12].toInt() and 0xFF
+
+        val headerSize =
+            ((dataOffsetByte ushr 4) and 0x0F) * 4
+
+        val reservedBits =
+            dataOffsetByte and TCP_RESERVED_MASK
+
+        val nsFlag =
+            (dataOffsetByte and TCP_NS_MASK) != 0
+
+        val flags =
+            packet[offset + 13].toInt() and 0xFF
+
+        if (
+            headerSize < TCP_HEADER_SIZE ||
+            headerSize > 60 ||
+            packet.size < offset + headerSize
+        ) {
+            throw IllegalStateException(
+                "Invalid TCP header length: $headerSize."
+            )
+        }
+
+        if (reservedBits != 0) {
+            throw IllegalStateException(
+                "Invalid TCP reserved bits: " +
+                    "0x${hexByte(reservedBits)}."
+            )
+        }
+
+        val window =
+            readUInt16BE(packet, offset + 14)
+
+        val payloadOffset =
+            offset + headerSize
+
+        val payload = packet.copyOfRange(
+            payloadOffset,
+            packet.size
+        )
+
+        if (nsFlag) {
+            lastReceivedBytes = (
+                lastReceivedBytes +
+                    "TCP NS flag observed.".toByteArray()
+                ).takeLastBytes(MAX_DIAGNOSTIC_BYTES)
+        }
+
+        return TcpPacket(
+            sequence = sequence,
+            acknowledgement = acknowledgement,
+            flags = flags,
+            window = window,
+            payload = payload
+        )
+    }
+
+    // ---------------------------------------------------------
+    // TCP PACKET BUILDER
+    // ---------------------------------------------------------
 
     private fun sendTcpPacket(
         flags: Int,
         sequence: Long,
-        acknowledgement: Long
+        acknowledgement: Long,
+        payload: ByteArray = ByteArray(0)
     ) {
 
-        val tcp = ByteArray(TCP_HEADER_SIZE)
+        require(
+            payload.size <=
+                MAX_PACKET_SIZE - MIN_TCP_PACKET_SIZE
+        )
+
+        val tcp = ByteArray(
+            TCP_HEADER_SIZE + payload.size
+        )
 
         putUInt16BE(tcp, 0, localPort)
         putUInt16BE(tcp, 2, remotePort)
@@ -322,27 +715,34 @@ class UsbMux2TcpConnection(
         putUInt32BE(tcp, 4, sequence)
         putUInt32BE(tcp, 8, acknowledgement)
 
-        // Data offset = 5 words = 20 bytes.
-        // Reserved bits = 0.
-        // NS flag = 0.
-        tcp[12] = 0x50
+        // TCP data offset = 5 words.
+        // Reserved bits and NS flag = zero.
+        tcp[12] = 0x50.toByte()
 
         tcp[13] = flags.toByte()
 
         putUInt16BE(tcp, 14, TCP_WINDOW)
 
-        // Checksum and urgent pointer.
+        // USBMUX2 pseudo-TCP does not use normal IP TCP checksums.
         putUInt16BE(tcp, 16, 0)
         putUInt16BE(tcp, 18, 0)
 
+        if (payload.isNotEmpty()) {
+            System.arraycopy(
+                payload,
+                0,
+                tcp,
+                TCP_HEADER_SIZE,
+                payload.size
+            )
+        }
+
         val packet = ByteArray(
-            MUX_HEADER_SIZE + TCP_HEADER_SIZE
+            MUX_HEADER_SIZE + tcp.size
         )
 
         putUInt32BE(packet, 0, PROTOCOL_TCP)
         putUInt32BE(packet, 4, packet.size.toLong())
-
-        // Outgoing Android -> Apple magic.
         putUInt32BE(packet, 8, MUX_MAGIC_OUT)
 
         putUInt16BE(packet, 12, muxTxSequence)
@@ -356,10 +756,13 @@ class UsbMux2TcpConnection(
             tcp.size
         )
 
-        val written = transport.write(packet, 3000)
+        val written = transport.write(
+            packet,
+            3000
+        )
 
         check(written == packet.size) {
-            "Incomplete USBMUX2 TCP write: " +
+            "Incomplete USBMUX2 write: " +
                 "$written/${packet.size} bytes."
         }
 
@@ -367,28 +770,33 @@ class UsbMux2TcpConnection(
             (muxTxSequence + 1) and 0xFFFF
     }
 
-    private fun readMuxPacket(deadline: Long): ByteArray? {
+    // ---------------------------------------------------------
+    // USBMUX2 PACKET READER
+    // ---------------------------------------------------------
 
-        while (SystemClock.elapsedRealtime() < deadline) {
+    private fun readMuxPacket(
+        deadline: Long
+    ): ByteArray? {
+
+        while (
+            SystemClock.elapsedRealtime() < deadline
+        ) {
 
             if (receiveBuffer.size >= 8) {
 
-                val packetLengthLong =
+                val length =
                     readUInt32BE(receiveBuffer, 4)
 
                 if (
-                    packetLengthLong < MIN_MUX_PACKET_SIZE.toLong() ||
-                    packetLengthLong > MAX_PACKET_SIZE.toLong()
+                    length < MIN_MUX_PACKET_SIZE.toLong() ||
+                    length > MAX_PACKET_SIZE.toLong()
                 ) {
                     throw IllegalStateException(
-                        "Invalid USBMUX2 packet length: " +
-                            "$packetLengthLong.\n" +
-                            indexedHex(receiveBuffer)
+                        "Invalid USBMUX2 packet length: $length."
                     )
                 }
 
-                val packetLength =
-                    packetLengthLong.toInt()
+                val packetLength = length.toInt()
 
                 if (receiveBuffer.size >= packetLength) {
 
@@ -417,9 +825,10 @@ class UsbMux2TcpConnection(
 
             val chunk = transport.read(
                 maxBytes = 4096,
-                timeoutMs = minOf(remaining, 500L)
-                    .toInt()
-                    .coerceAtLeast(1)
+                timeoutMs = minOf(
+                    remaining,
+                    500L
+                ).toInt().coerceAtLeast(1)
             )
 
             if (chunk != null && chunk.isNotEmpty()) {
@@ -433,7 +842,7 @@ class UsbMux2TcpConnection(
                     MAX_BUFFER_SIZE
                 ) {
                     throw IllegalStateException(
-                        "USBMUX2 receive buffer exceeded its limit."
+                        "USBMUX2 receive buffer limit exceeded."
                     )
                 }
 
@@ -444,52 +853,71 @@ class UsbMux2TcpConnection(
         return null
     }
 
-    private fun validateMuxHeader(packet: ByteArray) {
+    // ---------------------------------------------------------
+    // USBMUX2 HEADER VALIDATION
+    // ---------------------------------------------------------
+
+    private fun validateMuxHeader(
+        packet: ByteArray
+    ) {
 
         check(packet.size >= MIN_MUX_PACKET_SIZE) {
-            "USBMUX2 packet is too short: ${packet.size} bytes."
+            "USBMUX2 packet is too short."
         }
 
-        val protocol = readUInt32BE(packet, 0)
-        val length = readUInt32BE(packet, 4)
-        val magic = readUInt32BE(packet, 8)
+        val protocol =
+            readUInt32BE(packet, 0)
 
-        check(length == packet.size.toLong()) {
-            "USBMUX2 packet length mismatch. " +
-                "Header=$length Actual=${packet.size}.\n" +
-                indexedHex(packet)
-        }
+        val length =
+            readUInt32BE(packet, 4)
+
+        val magic =
+            readUInt32BE(packet, 8)
 
         check(protocol == PROTOCOL_TCP) {
             "Unexpected USBMUX2 protocol: $protocol."
         }
 
-        check(magic == MUX_MAGIC_IN) {
-            "Invalid incoming USBMUX2 magic. " +
-                "Received=0x${magic.toString(16)}, " +
-                "Expected=0x${MUX_MAGIC_IN.toString(16)}.\n" +
-                indexedHex(packet)
+        check(length == packet.size.toLong()) {
+            "USBMUX2 packet length mismatch."
         }
+
+        check(magic == MUX_MAGIC_IN) {
+            "Invalid incoming USBMUX2 magic: " +
+                "0x${magic.toString(16)}."
+        }
+
+        // Echo the latest received device sequence
+        // in the next outgoing USBMUX2 packet.
+        muxRxSequence =
+            readUInt16BE(packet, 14)
     }
 
-    private fun failure(
-        message: String,
-        packet: ByteArray
-    ): ConnectResult {
+    // ---------------------------------------------------------
+    // SEQUENCE HELPERS
+    // ---------------------------------------------------------
 
-        isConnected = false
-
-        return result(
-            false,
-            message,
-            indexedHex(packet)
-        )
+    private fun addSequence(
+        sequence: Long,
+        amount: Long
+    ): Long {
+        return (sequence + amount) and SEQUENCE_MASK
     }
 
-    /**
-     * Displays every byte with its exact packet offset.
-     */
-    private fun indexedHex(data: ByteArray): String {
+    private fun sequenceDistance(
+        start: Long,
+        end: Long
+    ): Long {
+        return (end - start) and SEQUENCE_MASK
+    }
+
+    // ---------------------------------------------------------
+    // DIAGNOSTICS
+    // ---------------------------------------------------------
+
+    private fun indexedHex(
+        data: ByteArray
+    ): String {
 
         if (data.isEmpty()) {
             return "No bytes."
@@ -527,12 +955,11 @@ class UsbMux2TcpConnection(
                     indexedHex(lastReceivedBytes)
 
             receiveBuffer.isNotEmpty() ->
-                "Remaining receive buffer:\n" +
-                    indexedHex(
-                        receiveBuffer.takeLastBytes(
-                            MAX_DIAGNOSTIC_BYTES
-                        )
+                indexedHex(
+                    receiveBuffer.takeLastBytes(
+                        MAX_DIAGNOSTIC_BYTES
                     )
+                )
 
             else ->
                 "No response bytes received."
@@ -553,6 +980,40 @@ class UsbMux2TcpConnection(
         )
     }
 
+    // ---------------------------------------------------------
+    // RESET AND CLOSE
+    // ---------------------------------------------------------
+
+    private fun resetConnectionState() {
+
+        isConnected = false
+        isRemoteClosed = false
+
+        receiveBuffer = ByteArray(0)
+        pendingReceivedData = ByteArray(0)
+
+        lastReceivedPacket = ByteArray(0)
+        lastReceivedBytes = ByteArray(0)
+
+        muxTxSequence = 1
+        muxRxSequence = 0xFFFF
+
+        tcpTxSequence = 0L
+        tcpTxAcknowledged = 0L
+        tcpRxAcknowledgement = 0L
+
+        peerWindow = TCP_WINDOW
+    }
+
+    @Synchronized
+    fun close() {
+        resetConnectionState()
+    }
+
+    // ---------------------------------------------------------
+    // RESULT HELPERS
+    // ---------------------------------------------------------
+
     private fun result(
         success: Boolean,
         message: String,
@@ -565,13 +1026,41 @@ class UsbMux2TcpConnection(
         rawResponse = rawResponse
     )
 
+    private fun failure(
+        message: String,
+        packet: ByteArray
+    ): ConnectResult {
+
+        isConnected = false
+
+        return result(
+            false,
+            message,
+            indexedHex(packet)
+        )
+    }
+
+    private fun transferFailure(
+        message: String
+    ) = TransferResult(
+        success = false,
+        message = message
+    )
+
+    // ---------------------------------------------------------
+    // BYTE HELPERS
+    // ---------------------------------------------------------
+
     private fun readUInt16BE(
         data: ByteArray,
         offset: Int
     ): Int {
 
-        return ((data[offset].toInt() and 0xFF) shl 8) or
-            (data[offset + 1].toInt() and 0xFF)
+        return (
+            (data[offset].toInt() and 0xFF) shl 8
+        ) or (
+            data[offset + 1].toInt() and 0xFF
+        )
     }
 
     private fun readUInt32BE(
@@ -579,10 +1068,15 @@ class UsbMux2TcpConnection(
         offset: Int
     ): Long {
 
-        return ((data[offset].toLong() and 0xFF) shl 24) or
-            ((data[offset + 1].toLong() and 0xFF) shl 16) or
-            ((data[offset + 2].toLong() and 0xFF) shl 8) or
-            (data[offset + 3].toLong() and 0xFF)
+        return (
+            (data[offset].toLong() and 0xFF) shl 24
+        ) or (
+            (data[offset + 1].toLong() and 0xFF) shl 16
+        ) or (
+            (data[offset + 2].toLong() and 0xFF) shl 8
+        ) or (
+            data[offset + 3].toLong() and 0xFF
+        )
     }
 
     private fun putUInt16BE(
@@ -607,11 +1101,9 @@ class UsbMux2TcpConnection(
         data[offset + 3] = value.toByte()
     }
 
-    private fun hexByte(value: Int): String =
-        "%02X".format(value and 0xFF)
-
-    @Synchronized
-    fun close() {
-        resetConnectionState()
+    private fun hexByte(
+        value: Int
+    ): String {
+        return "%02X".format(value and 0xFF)
     }
 }
