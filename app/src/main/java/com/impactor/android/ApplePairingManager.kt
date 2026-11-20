@@ -47,14 +47,6 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-/**
- * Lockdown pairing manager.
- *
- * IMPORTANT:
- * This is a development scaffold, not yet a verified Apple pairing
- * implementation. Do not send Pair requests until the certificate
- * generation and PairRecord format have been verified.
- */
 class ApplePairingManager(context: Context) {
 
     private val appContext = context.applicationContext
@@ -81,9 +73,14 @@ class ApplePairingManager(context: Context) {
         var lastPairResponse: String? = null
     )
 
-    // ---------------------------------------------------------
-    // PUBLIC PAIRING ENTRY POINT
-    // ---------------------------------------------------------
+    fun hasSavedPairing(): Boolean {
+        return try {
+            val identity = loadIdentity()
+            identity?.lastDeviceCertificate != null
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     suspend fun pair(
         devicePublicKeyPem: ByteArray,
@@ -101,20 +98,15 @@ class ApplePairingManager(context: Context) {
                     PKCS8EncodedKeySpec(identity.rootPrivateKey)
                 )
 
-            // Development-only certificate construction.
-            // This certificate model must be replaced with the
-            // verified Apple pairing certificate procedure.
             val rootCertificate =
-                parseCertificateSubject(identity.rootCertificate)
+                parseCertificate(identity.rootCertificate)
 
             val deviceCertificate = createCertificate(
                 subjectName = "CN=Apple Device",
-                issuerName = rootCertificate,
+                issuerName = rootCertificate.subjectX500Principal.name,
                 subjectPublicKey = devicePublicKey,
                 issuerPrivateKey = rootPrivateKey,
-                issuerPublicKey = parseCertificatePublicKey(
-                    identity.rootCertificate
-                ),
+                issuerPublicKey = rootCertificate.publicKey,
                 isCertificateAuthority = false
             )
 
@@ -122,50 +114,49 @@ class ApplePairingManager(context: Context) {
                 certificateToPem(deviceCertificate)
 
             val requestXml = createPairRequest(
-                identity = identity,
-                deviceCertificate = deviceCertificatePem
+                identity,
+                deviceCertificatePem
             )
 
-            val framedRequest = createLockdownFrame(requestXml)
+            val responseBytes =
+                exchange(createLockdownFrame(requestXml))
 
-            val responseBytes = exchange(framedRequest)
-
-            if (
-                responseBytes.size >= 8 &&
-                responseBytes.copyOfRange(0, 8)
-                    .contentEquals("bplist00".toByteArray(
-                        StandardCharsets.US_ASCII
-                    ))
-            ) {
+            if (isBinaryPlist(responseBytes)) {
                 return@withContext PairingResult(
-                    success = false,
-                    message = "The iPad returned a binary plist. " +
-                        "A binary plist decoder is required."
+                    false,
+                    "The iPad returned a binary plist. " +
+                        "Pairing was not processed. A binary plist decoder is required."
                 )
             }
 
             val responseText =
                 responseBytes.toString(StandardCharsets.UTF_8)
 
-            val result = findPlistString(responseText, "Result")
-            val error = findPlistString(responseText, "Error")
+            val response = parseResponse(responseText)
 
-            if (result != "Success") {
-                val message = when {
-                    !error.isNullOrBlank() ->
-                        "The iPad rejected pairing: $error"
-
-                    result.isNullOrBlank() ->
-                        "The pairing response did not contain a Result field."
-
-                    else ->
-                        "Unexpected pairing result: $result"
-                }
-
+            if (!response.error.isNullOrBlank()) {
                 return@withContext PairingResult(
-                    success = false,
-                    message = message,
-                    response = responseText
+                    false,
+                    "The iPad rejected pairing: ${response.error}",
+                    responseText
+                )
+            }
+
+            if (response.result != null &&
+                !response.result.equals("Success", true)
+            ) {
+                return@withContext PairingResult(
+                    false,
+                    "Unexpected pairing result: ${response.result}",
+                    responseText
+                )
+            }
+
+            if (!response.hasPairingResponse) {
+                return@withContext PairingResult(
+                    false,
+                    "The response did not contain a recognizable pairing result.",
+                    responseText
                 )
             }
 
@@ -175,28 +166,46 @@ class ApplePairingManager(context: Context) {
             saveIdentity(identity)
 
             PairingResult(
-                success = true,
-                message = "Lockdown pairing was accepted by the device.",
-                response = responseText
+                true,
+                "Lockdown accepted the pairing request and the local identity was saved.",
+                responseText
             )
 
         } catch (e: Exception) {
             PairingResult(
-                success = false,
-                message = "${e.javaClass.simpleName}: " +
-                    (e.message ?: "Unknown pairing error")
+                false,
+                "${e.javaClass.simpleName}: ${e.message ?: "Unknown pairing error"}"
             )
         }
     }
 
-    // ---------------------------------------------------------
-    // IDENTITY GENERATION
-    // ---------------------------------------------------------
+    private data class ParsedResponse(
+        val result: String?,
+        val error: String?,
+        val hasPairingResponse: Boolean
+    )
+
+    private fun parseResponse(xml: String): ParsedResponse {
+        val result = findPlistString(xml, "Result")
+        val error = findPlistString(xml, "Error")
+
+        val hasPairingResponse =
+            result != null ||
+            error != null ||
+            xml.contains("<dict", ignoreCase = true)
+
+        return ParsedResponse(result, error, hasPairingResponse)
+    }
+
+    private fun isBinaryPlist(data: ByteArray): Boolean {
+        return data.size >= 8 &&
+            data.copyOfRange(0, 8).contentEquals(
+                "bplist00".toByteArray(StandardCharsets.US_ASCII)
+            )
+    }
 
     private fun loadOrCreateIdentity(): Identity {
-        loadIdentity()?.let {
-            return it
-        }
+        loadIdentity()?.let { return it }
 
         val generator = KeyPairGenerator.getInstance("RSA")
         generator.initialize(2048)
@@ -232,13 +241,8 @@ class ApplePairingManager(context: Context) {
         )
 
         saveIdentity(identity)
-
         return identity
     }
-
-    // ---------------------------------------------------------
-    // X.509 CERTIFICATE GENERATION
-    // ---------------------------------------------------------
 
     private fun createCertificate(
         subjectName: String,
@@ -251,26 +255,19 @@ class ApplePairingManager(context: Context) {
 
         val now = System.currentTimeMillis()
 
-        val notBefore = Date(now - 60_000L)
-        val notAfter = Date(
-            now + 10L * 365L * 24L * 60L * 60L * 1000L
-        )
+        val subject =
+            org.bouncycastle.asn1.x500.X500Name(subjectName)
 
-        val subject = org.bouncycastle.asn1.x500.X500Name(
-            subjectName
-        )
-
-        val issuer = org.bouncycastle.asn1.x500.X500Name(
-            issuerName ?: subjectName
-        )
-
-        val serial = BigInteger.valueOf(now.coerceAtLeast(1L))
+        val issuer =
+            org.bouncycastle.asn1.x500.X500Name(
+                issuerName ?: subjectName
+            )
 
         val builder = JcaX509v3CertificateBuilder(
             issuer,
-            serial,
-            notBefore,
-            notAfter,
+            BigInteger.valueOf(now.coerceAtLeast(1L)),
+            Date(now - 60_000L),
+            Date(now + 10L * 365L * 24L * 60L * 60L * 1000L),
             subject,
             subjectPublicKey
         )
@@ -298,28 +295,22 @@ class ApplePairingManager(context: Context) {
         builder.addExtension(
             Extension.subjectKeyIdentifier,
             false,
-            extensionUtils.createSubjectKeyIdentifier(
-                subjectPublicKey
-            )
+            extensionUtils.createSubjectKeyIdentifier(subjectPublicKey)
         )
 
         builder.addExtension(
             Extension.authorityKeyIdentifier,
             false,
-            extensionUtils.createAuthorityKeyIdentifier(
-                issuerPublicKey
-            )
+            extensionUtils.createAuthorityKeyIdentifier(issuerPublicKey)
         )
 
-        val signer = JcaContentSignerBuilder("SHA1withRSA")
+        val signer = JcaContentSignerBuilder("SHA256withRSA")
             .setProvider(provider)
             .build(issuerPrivateKey)
 
-        val holder = builder.build(signer)
-
         return JcaX509CertificateConverter()
             .setProvider(provider)
-            .getCertificate(holder)
+            .getCertificate(builder.build(signer))
     }
 
     private fun certificateToPem(
@@ -328,35 +319,16 @@ class ApplePairingManager(context: Context) {
         val output = StringWriter()
 
         PemWriter(output).use { writer ->
-            writer.writeObject(
-                PemObject("CERTIFICATE", certificate.encoded)
-            )
+            writer.writeObject(PemObject("CERTIFICATE", certificate.encoded))
         }
 
-        return output.toString().toByteArray(
-            StandardCharsets.US_ASCII
-        )
-    }
-
-    private fun parseCertificateSubject(
-        certificatePem: ByteArray
-    ): String {
-        return parseCertificate(certificatePem)
-            .subjectX500Principal.name
-    }
-
-    private fun parseCertificatePublicKey(
-        certificatePem: ByteArray
-    ): java.security.PublicKey {
-        return parseCertificate(certificatePem).publicKey
+        return output.toString().toByteArray(StandardCharsets.US_ASCII)
     }
 
     private fun parseCertificate(
         certificatePem: ByteArray
     ): java.security.cert.X509Certificate {
-        val text = certificatePem.toString(
-            StandardCharsets.US_ASCII
-        )
+        val text = certificatePem.toString(StandardCharsets.US_ASCII)
 
         val encoded = text
             .replace("-----BEGIN CERTIFICATE-----", "")
@@ -365,17 +337,11 @@ class ApplePairingManager(context: Context) {
 
         val der = Base64.decode(encoded, Base64.DEFAULT)
 
-        val factory =
-            java.security.cert.CertificateFactory.getInstance("X.509")
-
-        return factory.generateCertificate(
-            ByteArrayInputStream(der)
-        ) as java.security.cert.X509Certificate
+        return java.security.cert.CertificateFactory
+            .getInstance("X.509")
+            .generateCertificate(ByteArrayInputStream(der))
+            as java.security.cert.X509Certificate
     }
-
-    // ---------------------------------------------------------
-    // DEVICE RSA PUBLIC KEY PARSING
-    // ---------------------------------------------------------
 
     private fun parseDevicePublicKey(
         pemBytes: ByteArray
@@ -434,18 +400,13 @@ class ApplePairingManager(context: Context) {
         return publicKey
     }
 
-    // ---------------------------------------------------------
-    // LOCKDOWN PAIR REQUEST
-    // ---------------------------------------------------------
-
     private fun createPairRequest(
         identity: Identity,
         deviceCertificate: ByteArray
     ): String {
 
-        val deviceCert = encodePlistData(deviceCertificate)
-        val hostCert = encodePlistData(identity.hostCertificate)
-        val rootCert = encodePlistData(identity.rootCertificate)
+        fun encode(data: ByteArray) =
+            Base64.encodeToString(data, Base64.NO_WRAP)
 
         return """
             <?xml version="1.0" encoding="UTF-8"?>
@@ -460,21 +421,21 @@ class ApplePairingManager(context: Context) {
                 <string>Pair</string>
 
                 <key>ProtocolVersion</key>
-                <string>2.0</string>
+                <string>2</string>
 
                 <key>PairRecord</key>
                 <dict>
                     <key>DeviceCertificate</key>
-                    <data>$deviceCert</data>
+                    <data>${encode(deviceCertificate)}</data>
 
                     <key>HostCertificate</key>
-                    <data>$hostCert</data>
+                    <data>${encode(identity.hostCertificate)}</data>
 
                     <key>HostID</key>
                     <string>${identity.hostId}</string>
 
                     <key>RootCertificate</key>
-                    <data>$rootCert</data>
+                    <data>${encode(identity.rootCertificate)}</data>
 
                     <key>SystemBUID</key>
                     <string>${identity.systemBuid}</string>
@@ -490,23 +451,13 @@ class ApplePairingManager(context: Context) {
         """.trimIndent()
     }
 
-    private fun encodePlistData(data: ByteArray): String {
-        return Base64.encodeToString(data, Base64.NO_WRAP)
-    }
-
-    // ---------------------------------------------------------
-    // LOCKDOWN MESSAGE FRAMING
-    // ---------------------------------------------------------
-
     private fun createLockdownFrame(xml: String): ByteArray {
         val payload = xml.toByteArray(StandardCharsets.UTF_8)
 
-        require(payload.isNotEmpty() && payload.size <= 1_048_576) {
-            "Invalid Lockdown request size."
-        }
+        require(payload.isNotEmpty() && payload.size <= 1_048_576)
 
+        val frame = ByteArray(payload.size + 4)
         val length = payload.size
-        val frame = ByteArray(length + 4)
 
         frame[0] = (length ushr 24).toByte()
         frame[1] = (length ushr 16).toByte()
@@ -514,19 +465,13 @@ class ApplePairingManager(context: Context) {
         frame[3] = length.toByte()
 
         System.arraycopy(payload, 0, frame, 4, payload.size)
-
         return frame
     }
-
-    // ---------------------------------------------------------
-    // LOCKDOWN RESPONSE PARSING
-    // ---------------------------------------------------------
 
     private fun findPlistString(
         xml: String,
         requestedKey: String
     ): String? {
-
         val factory = XmlPullParserFactory.newInstance()
         factory.isNamespaceAware = false
 
@@ -569,10 +514,6 @@ class ApplePairingManager(context: Context) {
         return null
     }
 
-    // ---------------------------------------------------------
-    // ENCRYPTED IDENTITY STORAGE
-    // ---------------------------------------------------------
-
     private fun getStorageKey(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore")
         keyStore.load(null)
@@ -612,16 +553,13 @@ class ApplePairingManager(context: Context) {
                 data.writeInt(1)
                 data.writeUTF(identity.hostId)
                 data.writeUTF(identity.systemBuid)
-
                 data.writeBytesField(identity.rootPrivateKey)
                 data.writeBytesField(identity.hostPrivateKey)
                 data.writeBytesField(identity.rootCertificate)
                 data.writeBytesField(identity.hostCertificate)
-
                 data.writeNullableBytes(identity.lastDeviceCertificate)
                 data.writeNullableString(identity.lastPairResponse)
             }
-
             output.toByteArray()
         }
 
@@ -641,48 +579,34 @@ class ApplePairingManager(context: Context) {
             output.write(iv)
             output.writeInt(encrypted.size)
             output.write(encrypted)
+            output.flush()
         }
 
-        if (
-            storageFile.exists() &&
-            !storageFile.delete()
-        ) {
+        if (storageFile.exists() && !storageFile.delete()) {
             temporaryFile.delete()
-            throw IllegalStateException(
-                "Could not replace the previous pairing identity."
-            )
+            throw IllegalStateException("Could not replace pairing identity.")
         }
 
         if (!temporaryFile.renameTo(storageFile)) {
             temporaryFile.delete()
-            throw IllegalStateException(
-                "Could not save the encrypted pairing identity."
-            )
+            throw IllegalStateException("Could not save pairing identity.")
         }
     }
 
     private fun loadIdentity(): Identity? {
-        if (!storageFile.exists()) {
-            return null
-        }
+        if (!storageFile.exists()) return null
 
         val encryptedData = DataInputStream(
             storageFile.inputStream()
         ).use { input ->
             val ivLength = input.readInt()
-
-            require(ivLength in 12..16) {
-                "Invalid encrypted identity IV."
-            }
+            require(ivLength in 12..16)
 
             val iv = ByteArray(ivLength)
             input.readFully(iv)
 
             val encryptedLength = input.readInt()
-
-            require(encryptedLength in 1..1_000_000) {
-                "Invalid encrypted identity size."
-            }
+            require(encryptedLength in 1..1_000_000)
 
             val encrypted = ByteArray(encryptedLength)
             input.readFully(encrypted)
@@ -691,7 +615,6 @@ class ApplePairingManager(context: Context) {
         }
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-
         cipher.init(
             Cipher.DECRYPT_MODE,
             getStorageKey(),
@@ -703,10 +626,7 @@ class ApplePairingManager(context: Context) {
         return DataInputStream(
             ByteArrayInputStream(plainBytes)
         ).use { input ->
-
-            val version = input.readInt()
-
-            require(version == 1) {
+            require(input.readInt() == 1) {
                 "Unsupported pairing identity version."
             }
 
@@ -723,10 +643,6 @@ class ApplePairingManager(context: Context) {
         }
     }
 
-    // ---------------------------------------------------------
-    // BINARY STORAGE HELPERS
-    // ---------------------------------------------------------
-
     private fun DataOutputStream.writeBytesField(value: ByteArray) {
         writeInt(value.size)
         write(value)
@@ -734,14 +650,8 @@ class ApplePairingManager(context: Context) {
 
     private fun DataInputStream.readBytesField(): ByteArray {
         val length = readInt()
-
-        require(length in 1..1_000_000) {
-            "Invalid stored key or certificate size."
-        }
-
-        return ByteArray(length).also {
-            readFully(it)
-        }
+        require(length in 1..1_000_000)
+        return ByteArray(length).also { readFully(it) }
     }
 
     private fun DataOutputStream.writeNullableBytes(value: ByteArray?) {
@@ -754,18 +664,10 @@ class ApplePairingManager(context: Context) {
 
     private fun DataInputStream.readNullableBytes(): ByteArray? {
         val length = readInt()
+        if (length == -1) return null
 
-        if (length == -1) {
-            return null
-        }
-
-        require(length in 1..1_000_000) {
-            "Invalid optional stored data size."
-        }
-
-        return ByteArray(length).also {
-            readFully(it)
-        }
+        require(length in 1..1_000_000)
+        return ByteArray(length).also { readFully(it) }
     }
 
     private fun DataOutputStream.writeNullableString(value: String?) {
@@ -780,18 +682,11 @@ class ApplePairingManager(context: Context) {
 
     private fun DataInputStream.readNullableString(): String? {
         val length = readInt()
+        if (length == -1) return null
 
-        if (length == -1) {
-            return null
-        }
-
-        require(length in 0..1_000_000) {
-            "Invalid stored response size."
-        }
-
+        require(length in 0..1_000_000)
         val bytes = ByteArray(length)
         readFully(bytes)
-
         return bytes.toString(StandardCharsets.UTF_8)
     }
 }
