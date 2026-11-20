@@ -1,17 +1,14 @@
 
 package com.impactor.android
 
-/**
- * Apple USBMUX device-side protocol.
- *
- * Implements the initial version negotiation only.
- * Does not yet implement USBMUX2 setup, pseudo-TCP, or Lockdown.
- */
+import java.io.ByteArrayOutputStream
+
 object UsbMuxProtocol {
 
-    private const val PROTOCOL_VERSION = 0
+    private const val VERSION_PROTOCOL = 0
+    private const val SETUP_PROTOCOL = 1
     private const val VERSION_PACKET_SIZE = 20
-    private const val HEADER_SIZE = 8
+    private const val BASIC_HEADER_SIZE = 8
     private const val MAX_PACKET_SIZE = 4096
 
     data class VersionResult(
@@ -22,150 +19,160 @@ object UsbMuxProtocol {
         val rawHex: String = ""
     )
 
-    /**
-     * Sends the initial USBMUX version request and waits for the response.
-     *
-     * Call this only after AppleUsbTransport.openUsbmux() succeeds.
-     */
     @Synchronized
     fun performVersionHandshake(
         transport: AppleUsbTransport,
         timeoutMs: Int = 5000
     ): VersionResult {
 
+        // Initial USBMUX version request: protocol 0, length 20,
+        // requested version 2.0, padding 0.
         val request = byteArrayOf(
-            // Protocol: VERSION (0), big-endian
-            0x00, 0x00, 0x00, 0x00,
-
-            // Total packet length: 20 bytes
-            0x00, 0x00, 0x00, 0x14,
-
-            // Requested major version: 2
-            0x00, 0x00, 0x00, 0x02,
-
-            // Requested minor version: 0
-            0x00, 0x00, 0x00, 0x00,
-
-            // Padding
-            0x00, 0x00, 0x00, 0x00
+            0, 0, 0, 0,
+            0, 0, 0, 20,
+            0, 0, 0, 2,
+            0, 0, 0, 0,
+            0, 0, 0, 0
         )
 
         val written = try {
             transport.write(request, timeoutMs)
         } catch (e: Exception) {
-            return VersionResult(
-                success = false,
-                message = "USBMUX version request failed: ${e.message}"
-            )
+            return failure("Version request write failed: ${e.message}")
         }
 
         if (written != request.size) {
-            return VersionResult(
-                success = false,
-                message = "Incomplete USB write: $written/${request.size} bytes"
+            return failure(
+                "Incomplete version request: $written/${request.size} bytes"
             )
         }
 
         val response = readPacket(transport, timeoutMs)
-            ?: return VersionResult(
-                success = false,
-                message = "No USBMUX version response received. Check the USB connection and active interface."
-            )
+            ?: return failure("No USBMUX version response received.")
 
-        val hex = response.joinToString(" ") {
-            "%02X".format(it.toInt() and 0xFF)
-        }
+        val rawHex = response.toHex()
 
         if (response.size < VERSION_PACKET_SIZE) {
-            return VersionResult(
-                success = false,
-                message = "Response too short: ${response.size} bytes",
-                rawHex = hex
+            return failure(
+                "Version response too short: ${response.size} bytes",
+                rawHex
             )
         }
 
         val protocol = readUInt32BE(response, 0)
         val packetLength = readUInt32BE(response, 4)
 
-        if (protocol != PROTOCOL_VERSION) {
-            return VersionResult(
-                success = false,
-                message = "Unexpected protocol: $protocol",
-                rawHex = hex
-            )
+        if (protocol != VERSION_PROTOCOL) {
+            return failure("Unexpected response protocol: $protocol", rawHex)
         }
 
         if (packetLength != response.size) {
-            return VersionResult(
-                success = false,
-                message = "Packet length mismatch: header=$packetLength, received=${response.size}",
-                rawHex = hex
+            return failure(
+                "Packet length mismatch: expected $packetLength, received ${response.size}",
+                rawHex
             )
         }
 
-        if (packetLength > MAX_PACKET_SIZE) {
-            return VersionResult(
-                success = false,
-                message = "USBMUX response exceeds maximum packet size",
-                rawHex = hex
-            )
-        }
-
-        val major = readUInt32BE(response, HEADER_SIZE)
-        val minor = readUInt32BE(response, HEADER_SIZE + 4)
+        val major = readUInt32BE(response, 8)
+        val minor = readUInt32BE(response, 12)
 
         if (major != 1 && major != 2) {
             return VersionResult(
-                success = false,
-                message = "Unsupported USBMUX version: $major.$minor",
-                majorVersion = major,
-                minorVersion = minor,
-                rawHex = hex
+                false,
+                "Unsupported USBMUX version: $major.$minor",
+                major,
+                minor,
+                rawHex
+            )
+        }
+
+        if (major == 2) {
+            val setupPacket = byteArrayOf(
+                // Protocol: SETUP (1)
+                0, 0, 0, 1,
+
+                // Total length: 17
+                0, 0, 0, 17,
+
+                // USBMUX2 magic: 0xFEEDFACE
+                0xFE.toByte(),
+                0xED.toByte(),
+                0xFA.toByte(),
+                0xCE.toByte(),
+
+                // TX sequence: 0
+                0, 0,
+
+                // RX sequence: 0xFFFF
+                0xFF.toByte(),
+                0xFF.toByte(),
+
+                // Setup payload
+                0x07
+            )
+
+            val setupWritten = try {
+                transport.write(setupPacket, timeoutMs)
+            } catch (e: Exception) {
+                return VersionResult(
+                    false,
+                    "Version $major.$minor received, but USBMUX2 setup write failed: ${e.message}",
+                    major,
+                    minor,
+                    rawHex
+                )
+            }
+
+            if (setupWritten != setupPacket.size) {
+                return VersionResult(
+                    false,
+                    "Version $major.$minor received, but setup packet was incomplete: $setupWritten/${setupPacket.size}",
+                    major,
+                    minor,
+                    rawHex
+                )
+            }
+
+            return VersionResult(
+                true,
+                "USBMUX version $major.$minor accepted. USBMUX2 setup packet sent; setup response not yet validated.",
+                major,
+                minor,
+                rawHex
             )
         }
 
         return VersionResult(
-            success = true,
-            message = "USBMUX version negotiation successful: $major.$minor",
-            majorVersion = major,
-            minorVersion = minor,
-            rawHex = hex
+            true,
+            "USBMUX version $major.$minor accepted. USBMUX1 mode.",
+            major,
+            minor,
+            rawHex
         )
     }
 
-    /**
-     * Reads one complete USBMUX packet using its length field.
-     */
     private fun readPacket(
         transport: AppleUsbTransport,
         timeoutMs: Int
     ): ByteArray? {
 
-        val buffer = ArrayList<Byte>()
+        val buffer = ByteArrayOutputStream()
         var expectedLength = -1
-        var attempts = 0
 
-        while (attempts < 10) {
-            attempts++
-
+        repeat(10) {
             val chunk = try {
-                transport.read(
-                    maxBytes = 4096,
-                    timeoutMs = timeoutMs
-                )
+                transport.read(4096, timeoutMs)
             } catch (_: Exception) {
                 return null
             } ?: return null
 
-            if (chunk.isEmpty()) continue
+            if (chunk.isEmpty()) return@repeat
 
-            for (byte in chunk) {
-                buffer.add(byte)
-            }
+            buffer.write(chunk)
+            val current = buffer.toByteArray()
 
-            if (buffer.size >= HEADER_SIZE && expectedLength < 0) {
-                val header = buffer.toByteArray()
-                expectedLength = readUInt32BE(header, 4)
+            if (current.size >= BASIC_HEADER_SIZE && expectedLength < 0) {
+                expectedLength = readUInt32BE(current, 4)
 
                 if (expectedLength < VERSION_PACKET_SIZE ||
                     expectedLength > MAX_PACKET_SIZE
@@ -174,8 +181,8 @@ object UsbMuxProtocol {
                 }
             }
 
-            if (expectedLength > 0 && buffer.size >= expectedLength) {
-                return buffer.take(expectedLength).toByteArray()
+            if (expectedLength > 0 && current.size >= expectedLength) {
+                return current.copyOf(expectedLength)
             }
         }
 
@@ -187,8 +194,22 @@ object UsbMuxProtocol {
         offset: Int
     ): Int {
         return ((data[offset].toInt() and 0xFF) shl 24) or
-                ((data[offset + 1].toInt() and 0xFF) shl 16) or
-                ((data[offset + 2].toInt() and 0xFF) shl 8) or
-                (data[offset + 3].toInt() and 0xFF)
+            ((data[offset + 1].toInt() and 0xFF) shl 16) or
+            ((data[offset + 2].toInt() and 0xFF) shl 8) or
+            (data[offset + 3].toInt() and 0xFF)
     }
+
+    private fun ByteArray.toHex(): String =
+        joinToString(" ") {
+            "%02X".format(it.toInt() and 0xFF)
+        }
+
+    private fun failure(
+        message: String,
+        rawHex: String = ""
+    ) = VersionResult(
+        success = false,
+        message = message,
+        rawHex = rawHex
+    )
 }
