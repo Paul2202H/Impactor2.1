@@ -17,13 +17,12 @@ import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.asn1.x509.SubjectPublicKeyInfo
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
-import org.bouncycastle.crypto.util.SubjectPublicKeyInfoFactory
+import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils
 import org.bouncycastle.jce.provider.BouncyCastleProvider
-import org.bouncycastle.openssl.PemObject
-import org.bouncycastle.openssl.PemWriter
 import org.bouncycastle.openssl.jcajce.JcaPEMKeyConverter
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
-import org.bouncycastle.cert.jcajce.JcaX509ExtensionUtils
+import org.bouncycastle.util.io.pem.PemObject
+import org.bouncycastle.util.io.pem.PemWriter
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.ByteArrayInputStream
@@ -35,7 +34,6 @@ import java.io.StringWriter
 import java.math.BigInteger
 import java.nio.charset.StandardCharsets
 import java.security.KeyFactory
-import java.security.KeyPair
 import java.security.KeyPairGenerator
 import java.security.KeyStore
 import java.security.MessageDigest
@@ -52,19 +50,15 @@ import javax.crypto.spec.GCMParameterSpec
 /**
  * Lockdown pairing manager.
  *
- * Responsibilities:
- * - Generate persistent HostID and SystemBUID values.
- * - Generate and securely store RSA root/host private keys.
- * - Generate the certificates required by Lockdown pairing.
- * - Build and send a Lockdown Pair request.
- * - Encrypt persistent pairing material with Android Keystore.
- *
- * The exchange callback must send a complete framed Lockdown request
- * and return the unframed Lockdown response payload.
+ * IMPORTANT:
+ * This is a development scaffold, not yet a verified Apple pairing
+ * implementation. Do not send Pair requests until the certificate
+ * generation and PairRecord format have been verified.
  */
 class ApplePairingManager(context: Context) {
 
     private val appContext = context.applicationContext
+
     private val storageFile =
         File(appContext.filesDir, "apple_pairing_identity.enc")
 
@@ -107,6 +101,9 @@ class ApplePairingManager(context: Context) {
                     PKCS8EncodedKeySpec(identity.rootPrivateKey)
                 )
 
+            // Development-only certificate construction.
+            // This certificate model must be replaced with the
+            // verified Apple pairing certificate procedure.
             val rootCertificate =
                 parseCertificateSubject(identity.rootCertificate)
 
@@ -131,20 +128,24 @@ class ApplePairingManager(context: Context) {
 
             val framedRequest = createLockdownFrame(requestXml)
 
-            // The callback handles USBMUX2 transmission and reception.
             val responseBytes = exchange(framedRequest)
 
-            val responseText =
-                responseBytes.toString(StandardCharsets.UTF_8)
-
-            if (responseText.startsWith("bplist00")) {
+            if (
+                responseBytes.size >= 8 &&
+                responseBytes.copyOfRange(0, 8)
+                    .contentEquals("bplist00".toByteArray(
+                        StandardCharsets.US_ASCII
+                    ))
+            ) {
                 return@withContext PairingResult(
                     success = false,
                     message = "The iPad returned a binary plist. " +
-                        "A binary plist decoder is required.",
-                    response = responseText
+                        "A binary plist decoder is required."
                 )
             }
+
+            val responseText =
+                responseBytes.toString(StandardCharsets.UTF_8)
 
             val result = findPlistString(responseText, "Result")
             val error = findPlistString(responseText, "Error")
@@ -263,9 +264,7 @@ class ApplePairingManager(context: Context) {
             issuerName ?: subjectName
         )
 
-        val serial = BigInteger.valueOf(
-            (now.coerceAtLeast(1L))
-        )
+        val serial = BigInteger.valueOf(now.coerceAtLeast(1L))
 
         val builder = JcaX509v3CertificateBuilder(
             issuer,
@@ -342,8 +341,8 @@ class ApplePairingManager(context: Context) {
     private fun parseCertificateSubject(
         certificatePem: ByteArray
     ): String {
-        val certificate = parseCertificate(certificatePem)
-        return certificate.subjectX500Principal.name
+        return parseCertificate(certificatePem)
+            .subjectX500Principal.name
     }
 
     private fun parseCertificatePublicKey(
@@ -499,9 +498,7 @@ class ApplePairingManager(context: Context) {
     // LOCKDOWN MESSAGE FRAMING
     // ---------------------------------------------------------
 
-    private fun createLockdownFrame(
-        xml: String
-    ): ByteArray {
+    private fun createLockdownFrame(xml: String): ByteArray {
         val payload = xml.toByteArray(StandardCharsets.UTF_8)
 
         require(payload.isNotEmpty() && payload.size <= 1_048_576) {
@@ -516,13 +513,7 @@ class ApplePairingManager(context: Context) {
         frame[2] = (length ushr 8).toByte()
         frame[3] = length.toByte()
 
-        System.arraycopy(
-            payload,
-            0,
-            frame,
-            4,
-            payload.size
-        )
+        System.arraycopy(payload, 0, frame, 4, payload.size)
 
         return frame
     }
@@ -736,9 +727,7 @@ class ApplePairingManager(context: Context) {
     // BINARY STORAGE HELPERS
     // ---------------------------------------------------------
 
-    private fun DataOutputStream.writeBytesField(
-        value: ByteArray
-    ) {
+    private fun DataOutputStream.writeBytesField(value: ByteArray) {
         writeInt(value.size)
         write(value)
     }
@@ -755,9 +744,7 @@ class ApplePairingManager(context: Context) {
         }
     }
 
-    private fun DataOutputStream.writeNullableBytes(
-        value: ByteArray?
-    ) {
+    private fun DataOutputStream.writeNullableBytes(value: ByteArray?) {
         if (value == null) {
             writeInt(-1)
         } else {
@@ -781,9 +768,7 @@ class ApplePairingManager(context: Context) {
         }
     }
 
-    private fun DataOutputStream.writeNullableString(
-        value: String?
-    ) {
+    private fun DataOutputStream.writeNullableString(value: String?) {
         if (value == null) {
             writeInt(-1)
         } else {
@@ -810,4 +795,3 @@ class ApplePairingManager(context: Context) {
         return bytes.toString(StandardCharsets.UTF_8)
     }
 }
-
