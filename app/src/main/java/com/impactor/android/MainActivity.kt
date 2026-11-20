@@ -47,6 +47,10 @@ import kotlinx.coroutines.withContext
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.ByteArrayOutputStream
+import java.security.KeyFactory
+import java.security.MessageDigest
+import java.security.interfaces.RSAPublicKey
+import java.security.spec.X509EncodedKeySpec
 
 class MainActivity : ComponentActivity() {
 
@@ -870,12 +874,29 @@ class MainActivity : ComponentActivity() {
 
                     val responseText = response.toString(Charsets.UTF_8)
 
-                    results[key] = if (
-                        responseText.startsWith("bplist00")
-                    ) {
-                        "Binary plist response received; XML parser cannot decode it."
-                    } else {
-                        extractGetValue(responseText)
+                    results[key] = when {
+                        responseText.startsWith("bplist00") -> {
+                            "Binary plist response received; XML parser cannot decode it."
+                        }
+
+                        extractPlistValue(responseText, "Error") != null -> {
+                            "Unavailable: ${
+                                extractPlistValue(responseText, "Error")
+                            }"
+                        }
+
+                        key == "DevicePublicKey" -> {
+                            val publicKey =
+                                extractPlistValue(responseText, "Value")
+
+                            if (publicKey is ByteArray && publicKey.isNotEmpty()) {
+                                inspectDevicePublicKey(publicKey)
+                            } else {
+                                "Invalid DevicePublicKey response. Expected binary data."
+                            }
+                        }
+
+                        else -> extractGetValue(responseText)
                     }
                 }
 
@@ -888,7 +909,9 @@ class MainActivity : ComponentActivity() {
                     appendLine()
 
                     results.forEach { (key, value) ->
-                        appendLine("$key: $value")
+                        appendLine("$key:")
+                        appendLine(value)
+                        appendLine()
                     }
                 }
 
@@ -977,9 +1000,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Finds a named plist key and parses its associated value.
-     */
     private fun extractPlistValue(
         xml: String,
         requestedKey: String
@@ -1032,9 +1052,6 @@ class MainActivity : ComponentActivity() {
         return null
     }
 
-    /**
-     * Parses the current plist START_TAG.
-     */
     private fun parsePlistElement(
         parser: XmlPullParser
     ): Any? {
@@ -1084,9 +1101,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Parses an XML plist array.
-     */
     private fun parsePlistArray(
         parser: XmlPullParser
     ): List<Any?> {
@@ -1113,9 +1127,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /**
-     * Parses an XML plist dictionary.
-     */
     private fun parsePlistDictionary(
         parser: XmlPullParser
     ): Map<String, Any?> {
@@ -1227,6 +1238,84 @@ class MainActivity : ComponentActivity() {
         }
 
         return publicKey
+    }
+
+    // ---------------------------------------------------------
+    // DEVICE PUBLIC KEY VALIDATION
+    // ---------------------------------------------------------
+
+    private fun inspectDevicePublicKey(data: ByteArray): String {
+        return try {
+            val report = StringBuilder()
+
+            report.appendLine("PUBLIC KEY VALIDATION")
+            report.appendLine("Received bytes: ${data.size}")
+            report.appendLine()
+
+            val keyFactory = KeyFactory.getInstance("RSA")
+
+            val publicKey = keyFactory.generatePublic(
+                X509EncodedKeySpec(data)
+            )
+
+            if (publicKey !is RSAPublicKey) {
+                return "Public key parsed, but it is not an RSA public key."
+            }
+
+            val modulus = publicKey.modulus
+            val exponent = publicKey.publicExponent
+
+            report.appendLine("Encoding: X.509 SubjectPublicKeyInfo")
+            report.appendLine("Algorithm: ${publicKey.algorithm}")
+            report.appendLine("Format: ${publicKey.format}")
+            report.appendLine("RSA key size: ${modulus.bitLength()} bits")
+            report.appendLine("Public exponent: $exponent")
+            report.appendLine()
+
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(data)
+
+            val fingerprint = digest.joinToString(":") {
+                "%02X".format(it)
+            }
+
+            report.appendLine("SHA-256 fingerprint:")
+            report.appendLine(fingerprint)
+            report.appendLine()
+
+            report.appendLine("Key validation: SUCCESS")
+            report.appendLine(
+                "Key can be parsed by Android RSA KeyFactory."
+            )
+            report.appendLine()
+            report.appendLine(
+                "This validates the key encoding, not the device's identity."
+            )
+
+            report.toString().trim()
+
+        } catch (e: Exception) {
+            val prefix = data.take(24).joinToString(" ") {
+                "%02X".format(it)
+            }
+
+            buildString {
+                appendLine("PUBLIC KEY VALIDATION FAILED")
+                appendLine("Received bytes: ${data.size}")
+                appendLine(
+                    "Encoding: Not recognized as RSA X.509 SubjectPublicKeyInfo"
+                )
+                appendLine()
+                appendLine("First 24 bytes:")
+                appendLine(prefix)
+                appendLine()
+                appendLine(
+                    "Error: ${e.message ?: e.javaClass.simpleName}"
+                )
+                appendLine()
+                appendLine("The key may use another encoding.")
+            }
+        }
     }
 
     // ---------------------------------------------------------
@@ -1638,6 +1727,7 @@ private fun Dashboard(
             StatusLine("Lockdown GetValue requests", true)
             StatusLine("XML plist data parsing", true)
             StatusLine("Nested XML plist parsing", true)
+            StatusLine("RSA public key validation", true)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
@@ -1648,7 +1738,7 @@ private fun Dashboard(
         }
 
         Text(
-            "This development build can test USBMUX and basic Lockdown requests. Pairing, signing, and IPA installation are not implemented.",
+            "This development build can test USBMUX, basic Lockdown requests, and RSA public-key parsing. Pairing, signing, and IPA installation are not implemented.",
             style = MaterialTheme.typography.bodySmall
         )
     }
