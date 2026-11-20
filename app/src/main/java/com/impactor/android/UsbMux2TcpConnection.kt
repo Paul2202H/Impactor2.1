@@ -8,12 +8,7 @@ import android.os.SystemClock
  *
  * Implements Apple's custom USBMUX2 TCP-like transport.
  *
- * Important:
- * - This is NOT a normal TCP implementation.
- * - TCP checksums are unused.
- * - TCP windows are scaled by 256.
- * - The protocol does not use TCP retransmissions.
- * - USBMUX2 has its own packet sequence numbers.
+ * This is an experimental implementation.
  */
 class UsbMux2TcpConnection(
     private val transport: AppleUsbTransport,
@@ -110,6 +105,14 @@ class UsbMux2TcpConnection(
 
     private var lastOutgoingSummary = "No outgoing packet."
     private var lastIncomingSummary = "No incoming packet."
+
+    private var lastPacketDecision =
+        "No incoming TCP packet processed."
+
+    private var lastPacketPreviousRxAck = 0L
+    private var lastPacketSequence = 0L
+    private var lastPacketAcceptedBytes = 0
+    private var lastPacketPayloadPreview = "None"
 
     @Volatile
     var isConnected = false
@@ -264,7 +267,7 @@ class UsbMux2TcpConnection(
         if (tcpTxSequence != tcpTxAcknowledged) {
             return transferFailure(
                 "Previous TCP-like data remains unacknowledged. " +
-                    "Reconnect before sending more data.\n" +
+                    "Do not send another request.\n" +
                     diagnostics()
             )
         }
@@ -346,9 +349,9 @@ class UsbMux2TcpConnection(
                 while (
                     SystemClock.elapsedRealtime() < deadline
                 ) {
-                    if (!isConnected || isRemoteClosed) {
+                    if (isRemoteClosed) {
                         throw IllegalStateException(
-                            "Connection closed while waiting for acknowledgement."
+                            "The remote device closed the connection."
                         )
                     }
 
@@ -374,14 +377,19 @@ class UsbMux2TcpConnection(
                 if (!acknowledged) {
 
                     /*
-                     * Preserve pendingReceivedData.
-                     * Do not clear incoming payload.
+                     * Do not immediately mark the connection
+                     * disconnected. Incoming data may still
+                     * be available for receive-only diagnostics.
+                     *
+                     * Do not send another request while the
+                     * previous segment remains unacknowledged.
                      */
-                    isConnected = false
 
                     return TransferResult(
                         false,
                         "USBMUX2 data acknowledgement timeout.\n" +
+                            "The outgoing segment remains unacknowledged.\n" +
+                            "The transport is retained for receive-only diagnostics.\n\n" +
                             "Segment start: $chunkStartSequence\n" +
                             "Segment size: ${chunk.size}\n" +
                             "Expected ACK: $expectedAck\n" +
@@ -390,8 +398,7 @@ class UsbMux2TcpConnection(
                             "${sequenceDistance(tcpTxAcknowledged, expectedAck)}\n\n" +
                             diagnostics() +
                             "\n\n" +
-                            pendingDataDiagnostics() +
-                            "\nConnection must be re-established.",
+                            pendingDataDiagnostics(),
                         totalSent,
                         diagnosticHex()
                     )
@@ -437,12 +444,6 @@ class UsbMux2TcpConnection(
         require(maxBytes > 0)
         require(timeoutMs > 0)
 
-        /*
-         * First drain existing data.
-         *
-         * This works even after sendData() has marked
-         * the connection disconnected.
-         */
         if (pendingReceivedData.isNotEmpty()) {
             return drainPendingData(maxBytes)
         }
@@ -598,7 +599,29 @@ class UsbMux2TcpConnection(
 
         val tcp = parseTcpPacket(packet) ?: return
 
+        val previousRxAck = tcpRxAcknowledgement
+
+        lastPacketPreviousRxAck = previousRxAck
+        lastPacketSequence = tcp.sequence
+        lastPacketAcceptedBytes = 0
+
+        lastPacketPayloadPreview =
+            if (tcp.payload.isEmpty()) {
+                "No payload"
+            } else {
+                indexedHex(
+                    tcp.payload.copyOfRange(
+                        0,
+                        minOf(tcp.payload.size, 64)
+                    )
+                )
+            }
+
+        lastPacketDecision = "Processing packet."
+
         if ((tcp.flags and TCP_RST) != 0) {
+
+            lastPacketDecision = "REJECTED: TCP RST received."
 
             isConnected = false
             isRemoteClosed = true
@@ -631,17 +654,43 @@ class UsbMux2TcpConnection(
 
                 pendingReceivedData += tcp.payload
 
+                lastPacketAcceptedBytes = tcp.payload.size
+
                 tcpRxAcknowledgement = addSequence(
                     tcpRxAcknowledgement,
                     tcp.payload.size.toLong()
                 )
 
+                lastPacketDecision =
+                    "ACCEPTED: ${tcp.payload.size} payload bytes."
+
                 shouldSendAck = true
 
             } else {
-                // Duplicate or out-of-order payload.
+
+                val distance = sequenceDistance(
+                    tcpRxAcknowledgement,
+                    tcp.sequence
+                )
+
+                lastPacketDecision =
+                    if (distance >= SEQUENCE_HALF) {
+                        "DUPLICATE/OLD: Expected sequence " +
+                            "$tcpRxAcknowledgement, received " +
+                            "${tcp.sequence}."
+                    } else {
+                        "OUT OF ORDER: Expected sequence " +
+                            "$tcpRxAcknowledgement, received " +
+                            "${tcp.sequence}."
+                    }
+
                 shouldSendAck = true
             }
+
+        } else {
+
+            lastPacketDecision =
+                "ACK/control packet; no payload."
         }
 
         if ((tcp.flags and TCP_FIN) != 0) {
@@ -659,12 +708,28 @@ class UsbMux2TcpConnection(
                 )
 
                 isRemoteClosed = true
+
+                lastPacketDecision += " FIN accepted."
+
+            } else {
+                lastPacketDecision += " FIN sequence mismatch."
             }
 
             shouldSendAck = true
         }
 
+        lastIncomingSummary =
+            "SEQ=${tcp.sequence} " +
+                "ACK=${tcp.acknowledgement} " +
+                "FLAGS=0x${hexByte(tcp.flags)} " +
+                "PAYLOAD=${tcp.payload.size} " +
+                "PREVIOUS_RX_ACK=$previousRxAck " +
+                "NEW_RX_ACK=$tcpRxAcknowledgement " +
+                "ACCEPTED=$lastPacketAcceptedBytes " +
+                "DECISION=$lastPacketDecision"
+
         if (shouldSendAck) {
+
             sendTcpPacket(
                 flags = TCP_ACK,
                 sequence = tcpTxSequence,
@@ -1101,6 +1166,30 @@ class UsbMux2TcpConnection(
             appendLine("Pending data: ${pendingReceivedData.size} bytes")
 
             appendLine()
+            appendLine("=== LAST PACKET PROCESSING ===")
+
+            appendLine(
+                "Previous RX acknowledgement: $lastPacketPreviousRxAck"
+            )
+
+            appendLine(
+                "Incoming sequence: $lastPacketSequence"
+            )
+
+            appendLine(
+                "Accepted payload bytes: $lastPacketAcceptedBytes"
+            )
+
+            appendLine(
+                "Packet decision: $lastPacketDecision"
+            )
+
+            appendLine()
+            appendLine("Payload preview:")
+
+            appendLine(lastPacketPayloadPreview)
+
+            appendLine()
             appendLine("=== LAST OUTGOING PACKET ===")
 
             appendLine(lastOutgoingSummary)
@@ -1194,6 +1283,14 @@ class UsbMux2TcpConnection(
 
         lastOutgoingSummary = "No outgoing packet."
         lastIncomingSummary = "No incoming packet."
+
+        lastPacketDecision =
+            "No incoming TCP packet processed."
+
+        lastPacketPreviousRxAck = 0L
+        lastPacketSequence = 0L
+        lastPacketAcceptedBytes = 0
+        lastPacketPayloadPreview = "None"
 
         muxTxSequence = 1
         muxRxSequence = 0xFFFF
