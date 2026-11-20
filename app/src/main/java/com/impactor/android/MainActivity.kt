@@ -57,6 +57,10 @@ class MainActivity : ComponentActivity() {
         "USB transport is closed"
     )
 
+    private val usbmuxInfo = mutableStateOf(
+        "USBMUX handshake has not been tested."
+    )
+
     private val ipaInfo = mutableStateOf(
         "No IPA selected"
     )
@@ -65,7 +69,6 @@ class MainActivity : ComponentActivity() {
         "No installation operation has been run"
     )
 
-    // Retains the complete diagnostic output for copying.
     private val diagnosticReport = mutableStateOf("")
 
     private var transport: AppleUsbTransport? = null
@@ -152,7 +155,6 @@ class MainActivity : ComponentActivity() {
                 }
 
                 UsbManager.ACTION_USB_DEVICE_ATTACHED -> {
-
                     status.value = "USB device attached"
                     refreshDevices()
                 }
@@ -241,6 +243,7 @@ class MainActivity : ComponentActivity() {
                         devices = usbDevices.toList(),
                         status = status.value,
                         transportInfo = transportInfo.value,
+                        usbmuxInfo = usbmuxInfo.value,
                         ipaInfo = ipaInfo.value,
                         operationStatus = operationStatus.value,
                         hasDiagnosticReport =
@@ -249,6 +252,7 @@ class MainActivity : ComponentActivity() {
                         onScan = ::refreshDevices,
                         onRequestPermission = ::requestUsbPermission,
                         onProbe = ::probeUsbTransport,
+                        onUsbMuxHandshake = ::testUsbMuxHandshake,
                         onCloseTransport = ::closeTransport,
 
                         onCopyDiagnostics = {
@@ -365,8 +369,8 @@ class MainActivity : ComponentActivity() {
         closeTransport()
 
         diagnosticReport.value = ""
+        usbmuxInfo.value = "USBMUX handshake has not been tested."
         transportInfo.value = "Running USB diagnostics..."
-
         status.value = "Inspecting Apple usbmux interface..."
 
         lifecycleScope.launch {
@@ -410,20 +414,13 @@ class MainActivity : ComponentActivity() {
                     )
 
                     report.appendLine()
-
                     report.appendLine("INTERFACE DESCRIPTORS")
 
                     interfaces.forEachIndexed { index, info ->
 
                         report.appendLine("Descriptor entry: $index")
-
-                        report.appendLine(
-                            "Configuration: ${info.configurationId}"
-                        )
-
-                        report.appendLine(
-                            "Interface number: ${info.interfaceNumber}"
-                        )
+                        report.appendLine("Configuration: ${info.configurationId}")
+                        report.appendLine("Interface number: ${info.interfaceNumber}")
 
                         report.appendLine(
                             "Class/Subclass/Protocol: %02X/%02X/%02X".format(
@@ -464,9 +461,7 @@ class MainActivity : ComponentActivity() {
                         candidates.filter { it.isLikelyUsbmux }
 
                     report.appendLine("APPLE USBMUX TEST")
-                    report.appendLine(
-                        "Expected descriptor: FF/FE/02"
-                    )
+                    report.appendLine("Expected descriptor: FF/FE/02")
                     report.appendLine(
                         "Matching candidates: ${usbmuxCandidates.size}"
                     )
@@ -478,10 +473,7 @@ class MainActivity : ComponentActivity() {
                             "RESULT: No Apple usbmux interface with bulk IN and OUT endpoints."
                         )
 
-                        return@withContext Pair(
-                            null,
-                            report.toString()
-                        )
+                        return@withContext Pair(null, report.toString())
                     }
 
                     report.appendLine(
@@ -550,10 +542,7 @@ class MainActivity : ComponentActivity() {
 
                     } catch (e: Exception) {
 
-                        report.appendLine(
-                            "USBMUX INTERFACE CLAIM: FAILED"
-                        )
-
+                        report.appendLine("USBMUX INTERFACE CLAIM: FAILED")
                         report.appendLine(
                             e.message ?: e.javaClass.simpleName
                         )
@@ -590,8 +579,83 @@ class MainActivity : ComponentActivity() {
 
                 diagnosticReport.value = errorReport
                 transportInfo.value = errorReport
-
                 status.value = "USB diagnostic failed."
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // USBMUX VERSION HANDSHAKE
+    // ---------------------------------------------------------
+
+    private fun testUsbMuxHandshake() {
+
+        val activeTransport = transport
+
+        if (activeTransport == null) {
+            status.value = "Claim the Apple usbmux interface first."
+            return
+        }
+
+        usbmuxInfo.value = "Sending USBMUX version request..."
+        status.value = "Testing Apple USBMUX protocol..."
+
+        lifecycleScope.launch {
+
+            try {
+
+                val result = withContext(Dispatchers.IO) {
+
+                    UsbMuxProtocol.performVersionHandshake(
+                        transport = activeTransport,
+                        timeoutMs = 5000
+                    )
+                }
+
+                val report = buildString {
+
+                    appendLine("APPLE USBMUX VERSION TEST")
+                    appendLine("Date: ${java.util.Date()}")
+                    appendLine("Result: ${result.message}")
+                    appendLine("Success: ${result.success}")
+
+                    appendLine(
+                        "Version: ${
+                            result.majorVersion ?: "Unknown"
+                        }.${result.minorVersion ?: "Unknown"}"
+                    )
+
+                    appendLine()
+                    appendLine("RAW RESPONSE:")
+
+                    appendLine(
+                        result.rawHex.ifBlank {
+                            "No response data"
+                        }
+                    )
+                }
+
+                usbmuxInfo.value = report
+
+                diagnosticReport.value =
+                    diagnosticReport.value + "\n\n" + report
+
+                status.value =
+                    if (result.success) {
+                        "USBMUX version negotiation completed. Check the report."
+                    } else {
+                        "USBMUX handshake failed. Check the diagnostic report."
+                    }
+
+            } catch (e: Exception) {
+
+                val error =
+                    "USBMUX TEST ERROR\n" +
+                        "${e.javaClass.simpleName}: ${e.message}"
+
+                usbmuxInfo.value = error
+                diagnosticReport.value += "\n\n$error"
+                status.value = "USBMUX test failed."
             }
         }
     }
@@ -607,8 +671,8 @@ class MainActivity : ComponentActivity() {
         }
 
         transport = null
-
         transportInfo.value = "USB transport is closed"
+        usbmuxInfo.value = "USBMUX handshake has not been tested."
     }
 
     // ---------------------------------------------------------
@@ -721,12 +785,14 @@ private fun Dashboard(
     devices: List<UsbDevice>,
     status: String,
     transportInfo: String,
+    usbmuxInfo: String,
     ipaInfo: String,
     operationStatus: String,
     hasDiagnosticReport: Boolean,
     onScan: () -> Unit,
     onRequestPermission: (UsbDevice) -> Unit,
     onProbe: () -> Unit,
+    onUsbMuxHandshake: () -> Unit,
     onCloseTransport: () -> Unit,
     onCopyDiagnostics: () -> Unit,
     onCopyIpa: () -> Unit,
@@ -784,6 +850,18 @@ private fun Dashboard(
             ) {
                 Text("Copy USB Diagnostic Results")
             }
+
+            Button(
+                onClick = onUsbMuxHandshake,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Test USBMUX Handshake")
+            }
+
+            Text(
+                usbmuxInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
         }
 
         SectionCard("APPLE DEVICES") {
@@ -872,7 +950,9 @@ private fun Dashboard(
             StatusLine("Android USB permission", true)
             StatusLine("USB bulk endpoint diagnostics", true)
             StatusLine("Apple usbmux interface selection", true)
-            StatusLine("Apple usbmux protocol handshake", false)
+            StatusLine("Apple usbmux version test", false)
+            StatusLine("USBMUX2 setup response validation", false)
+            StatusLine("Pseudo-TCP transport", false)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
@@ -883,7 +963,7 @@ private fun Dashboard(
         }
 
         Text(
-            "This development build does not yet pair, sign, or install applications. USB interface probing is diagnostic only.",
+            "This development build does not yet pair, sign, or install applications. USB interface probing and USBMUX protocol tests are diagnostic only.",
             style = MaterialTheme.typography.bodySmall
         )
     }
