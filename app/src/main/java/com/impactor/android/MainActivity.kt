@@ -13,6 +13,8 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
+import android.util.Base64
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -42,6 +44,8 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.xmlpull.v1.XmlPullParser
+import org.xmlpull.v1.XmlPullParserFactory
 import java.io.ByteArrayOutputStream
 
 class MainActivity : ComponentActivity() {
@@ -115,10 +119,13 @@ class MainActivity : ComponentActivity() {
 
                     if (granted && device != null) {
                         selectedDevice = device
-                        status.value = "USB permission granted. Device is not paired yet."
+                        status.value =
+                            "USB permission granted. Device is not paired yet."
                     } else {
-                        status.value = "USB permission denied or device disconnected."
+                        status.value =
+                            "USB permission denied or device disconnected."
                     }
+
                     refreshDevices()
                 }
 
@@ -215,7 +222,10 @@ class MainActivity : ComponentActivity() {
                             )
                         },
                         onCopyIpa = {
-                            copyToClipboard("Impactor IPA Information", ipaInfo.value)
+                            copyToClipboard(
+                                "Impactor IPA Information",
+                                ipaInfo.value
+                            )
                         },
                         onChooseIpa = {
                             ipaPicker.launch(
@@ -310,20 +320,28 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
-                    val interfaces = AppleUsbTransport.inspectInterfaces(device)
-                    val candidates = AppleUsbTransport.candidates(device)
+                    val interfaces =
+                        AppleUsbTransport.inspectInterfaces(device)
+
+                    val candidates =
+                        AppleUsbTransport.candidates(device)
+
                     val report = StringBuilder()
 
                     report.appendLine("USB DEVICE DIAGNOSTICS")
                     report.appendLine("Date: ${java.util.Date()}")
-                    report.appendLine("Product: ${device.productName ?: "Apple device"}")
+                    report.appendLine(
+                        "Product: ${device.productName ?: "Apple device"}"
+                    )
                     report.appendLine(
                         "VID: %04X  PID: %04X".format(
                             device.vendorId,
                             device.productId
                         )
                     )
-                    report.appendLine("Configuration count: ${device.configurationCount}")
+                    report.appendLine(
+                        "Configuration count: ${device.configurationCount}"
+                    )
                     report.appendLine("Total interfaces: ${interfaces.size}")
                     report.appendLine("Bulk candidates: ${candidates.size}")
                     report.appendLine()
@@ -331,8 +349,12 @@ class MainActivity : ComponentActivity() {
 
                     interfaces.forEachIndexed { index, info ->
                         report.appendLine("Descriptor entry: $index")
-                        report.appendLine("Configuration: ${info.configurationId}")
-                        report.appendLine("Interface number: ${info.interfaceNumber}")
+                        report.appendLine(
+                            "Configuration: ${info.configurationId}"
+                        )
+                        report.appendLine(
+                            "Interface number: ${info.interfaceNumber}"
+                        )
                         report.appendLine(
                             "Class/Subclass/Protocol: %02X/%02X/%02X".format(
                                 info.interfaceClass,
@@ -340,7 +362,9 @@ class MainActivity : ComponentActivity() {
                                 info.interfaceProtocol
                             )
                         )
-                        report.appendLine("Alternate setting: ${info.alternateSetting}")
+                        report.appendLine(
+                            "Alternate setting: ${info.alternateSetting}"
+                        )
                         report.appendLine(
                             "Bulk IN: ${
                                 info.bulkInEndpoints.joinToString {
@@ -355,15 +379,20 @@ class MainActivity : ComponentActivity() {
                                 }.ifEmpty { "None" }
                             }"
                         )
-                        report.appendLine("Likely usbmux: ${info.isLikelyUsbmux}")
+                        report.appendLine(
+                            "Likely usbmux: ${info.isLikelyUsbmux}"
+                        )
                         report.appendLine()
                     }
 
-                    val usbmuxCandidates = candidates.filter { it.isLikelyUsbmux }
+                    val usbmuxCandidates =
+                        candidates.filter { it.isLikelyUsbmux }
 
                     report.appendLine("APPLE USBMUX TEST")
                     report.appendLine("Expected descriptor: FF/FE/02")
-                    report.appendLine("Matching candidates: ${usbmuxCandidates.size}")
+                    report.appendLine(
+                        "Matching candidates: ${usbmuxCandidates.size}"
+                    )
                     report.appendLine()
 
                     if (usbmuxCandidates.isEmpty()) {
@@ -388,8 +417,12 @@ class MainActivity : ComponentActivity() {
                         )
 
                         report.appendLine("USBMUX INTERFACE CLAIM: SUCCESS")
-                        report.appendLine("Configuration: ${opened.details.configurationId}")
-                        report.appendLine("Interface: ${opened.details.interfaceNumber}")
+                        report.appendLine(
+                            "Configuration: ${opened.details.configurationId}"
+                        )
+                        report.appendLine(
+                            "Interface: ${opened.details.interfaceNumber}"
+                        )
                         report.appendLine(
                             "Alternate setting: ${opened.details.alternateSetting}"
                         )
@@ -421,11 +454,14 @@ class MainActivity : ComponentActivity() {
                         Pair(opened, report.toString())
                     } catch (e: Exception) {
                         report.appendLine("USBMUX INTERFACE CLAIM: FAILED")
-                        report.appendLine(e.message ?: e.javaClass.simpleName)
+                        report.appendLine(
+                            e.message ?: e.javaClass.simpleName
+                        )
                         report.appendLine()
                         report.appendLine(
                             "No fallback to interface 0 was attempted."
                         )
+
                         Pair(null, report.toString())
                     }
                 }
@@ -433,18 +469,22 @@ class MainActivity : ComponentActivity() {
                 transport = result.first
                 diagnosticReport.value = result.second
                 transportInfo.value = result.second
+
                 status.value =
                     if (result.first != null) {
                         "Apple usbmux USB interface claimed. Protocol session not established."
                     } else {
                         "Apple usbmux interface claim failed. See diagnostic report."
                     }
+
             } catch (t: Exception) {
                 transport = null
+
                 val errorReport =
                     "USB DIAGNOSTIC FAILED\n\n" +
                         "${t.javaClass.simpleName}: " +
                         (t.message ?: "Unknown error")
+
                 diagnosticReport.value = errorReport
                 transportInfo.value = errorReport
                 status.value = "USB diagnostic failed."
@@ -504,7 +544,9 @@ class MainActivity : ComponentActivity() {
                     appendLine("USBMUX2 readiness: $usbmux2Ready")
                     appendLine()
                     appendLine("RAW RESPONSE:")
-                    appendLine(result.rawHex.ifBlank { "No response data" })
+                    appendLine(
+                        result.rawHex.ifBlank { "No response data" }
+                    )
                 }
 
                 usbmuxInfo.value = report
@@ -518,14 +560,18 @@ class MainActivity : ComponentActivity() {
                     } else {
                         "USBMUX handshake failed. Check the diagnostic report."
                     }
+
             } catch (e: Exception) {
                 usbmux2Ready = false
+
                 val error =
                     "USBMUX TEST ERROR\n" +
                         "${e.javaClass.simpleName}: ${e.message}"
+
                 usbmuxInfo.value = error
                 diagnosticReport.value += "\n\n$error"
                 status.value = "USBMUX test failed."
+
             } finally {
                 usbmuxTestRunning = false
             }
@@ -545,7 +591,8 @@ class MainActivity : ComponentActivity() {
         }
 
         if (!usbmux2Ready) {
-            status.value = "Run a successful USBMUX2 version handshake first."
+            status.value =
+                "Run a successful USBMUX2 version handshake first."
             return
         }
 
@@ -660,10 +707,12 @@ class MainActivity : ComponentActivity() {
                             connection.close()
                         }
                     }
+
                     lockdownTcp = null
 
                     status.value =
                         "Lockdown TCP transmission failed. Copy diagnostics for inspection."
+
                     return@launch
                 }
 
@@ -723,6 +772,7 @@ class MainActivity : ComponentActivity() {
                     } else {
                         "Lockdown response received. Inspect the response before proceeding."
                     }
+
             } catch (e: Exception) {
                 val error =
                     "LOCKDOWN QUERYTYPE TEST ERROR\n" +
@@ -741,6 +791,7 @@ class MainActivity : ComponentActivity() {
                     }
                     lockdownTcp = null
                 }
+
             } finally {
                 lockdownTestRunning = false
             }
@@ -818,7 +869,14 @@ class MainActivity : ComponentActivity() {
                     }
 
                     val responseText = response.toString(Charsets.UTF_8)
-                    results[key] = extractGetValue(responseText)
+
+                    results[key] = if (
+                        responseText.startsWith("bplist00")
+                    ) {
+                        "Binary plist response received; XML parser cannot decode it."
+                    } else {
+                        extractGetValue(responseText)
+                    }
                 }
 
                 val report = buildString {
@@ -836,6 +894,7 @@ class MainActivity : ComponentActivity() {
 
                 deviceInfo.value = report
                 diagnosticReport.value += "\n\n$report"
+
                 status.value =
                     "Lockdown GetValue requests completed. Check the device information."
 
@@ -865,46 +924,309 @@ class MainActivity : ComponentActivity() {
                     }
                     lockdownTcp = null
                 }
+
             } finally {
                 lockdownTestRunning = false
             }
         }
     }
 
+    // ---------------------------------------------------------
+    // LOCKDOWN XML PLIST PARSER
+    // ---------------------------------------------------------
+
     private fun extractGetValue(xml: String): String {
-        val errorMatch = Regex(
-            """<key>\s*Error\s*</key>\s*<string>(.*?)</string>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        ).find(xml)
+        return try {
+            val error = extractPlistValue(xml, "Error")
 
-        if (errorMatch != null) {
-            return "Unavailable: ${decodeXml(errorMatch.groupValues[1])}"
+            if (error != null) {
+                return "Unavailable: $error"
+            }
+
+            val value = extractPlistValue(xml, "Value")
+
+            when (value) {
+                null -> "No Value field returned."
+
+                is String -> value.ifBlank { "Empty value" }
+
+                is ByteArray -> {
+                    "Binary data returned: ${value.size} bytes. " +
+                        "Base64 decoding successful."
+                }
+
+                is Boolean -> value.toString()
+
+                is Number -> value.toString()
+
+                is Map<*, *> -> {
+                    "Dictionary returned with ${value.size} entries."
+                }
+
+                is List<*> -> {
+                    "Array returned with ${value.size} items."
+                }
+
+                else -> {
+                    "Unsupported plist value: ${value.javaClass.simpleName}"
+                }
+            }
+
+        } catch (e: Exception) {
+            "Plist parsing failed: ${e.message ?: e.javaClass.simpleName}"
         }
-
-        val valueMatch = Regex(
-            """<key>\s*Value\s*</key>\s*<(string|integer)>(.*?)</\1>""",
-            setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL)
-        ).find(xml)
-
-        if (valueMatch != null) {
-            val value = valueMatch.groupValues[2].trim()
-            return decodeXml(value).ifBlank { "Empty value" }
-        }
-
-        if (Regex("""<key>\s*Value\s*</key>""").containsMatchIn(xml)) {
-            return "Value returned in an unsupported plist format."
-        }
-
-        return "No Value field returned."
     }
 
-    private fun decodeXml(value: String): String {
-        return value
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&amp;", "&")
+    /**
+     * Finds a named plist key and parses its associated value.
+     */
+    private fun extractPlistValue(
+        xml: String,
+        requestedKey: String
+    ): Any? {
+        val trimmed = xml.trimStart()
+
+        require(
+            trimmed.startsWith("<?xml") ||
+                trimmed.startsWith("<plist")
+        ) {
+            "Response is not an XML plist."
+        }
+
+        val factory = XmlPullParserFactory.newInstance()
+        factory.isNamespaceAware = false
+
+        val parser = factory.newPullParser()
+        parser.setInput(xml.reader())
+
+        var event = parser.eventType
+
+        while (event != XmlPullParser.END_DOCUMENT) {
+            if (
+                event == XmlPullParser.START_TAG &&
+                parser.name == "key"
+            ) {
+                val key = parser.nextText()
+
+                if (key == requestedKey) {
+                    var nextEvent = parser.next()
+
+                    while (
+                        nextEvent == XmlPullParser.TEXT &&
+                        parser.isWhitespace
+                    ) {
+                        nextEvent = parser.next()
+                    }
+
+                    if (nextEvent != XmlPullParser.START_TAG) {
+                        return null
+                    }
+
+                    return parsePlistElement(parser)
+                }
+            }
+
+            event = parser.next()
+        }
+
+        return null
+    }
+
+    /**
+     * Parses the current plist START_TAG.
+     */
+    private fun parsePlistElement(
+        parser: XmlPullParser
+    ): Any? {
+        return when (parser.name) {
+            "string" -> parser.nextText()
+
+            "integer" -> {
+                parser.nextText().trim().toLongOrNull()
+                    ?: throw IllegalArgumentException(
+                        "Invalid plist integer."
+                    )
+            }
+
+            "real" -> {
+                parser.nextText().trim().toDoubleOrNull()
+                    ?: throw IllegalArgumentException(
+                        "Invalid plist real number."
+                    )
+            }
+
+            "data" -> {
+                val encoded = parser.nextText()
+                    .filterNot { it.isWhitespace() }
+
+                if (encoded.isEmpty()) {
+                    ByteArray(0)
+                } else {
+                    Base64.decode(encoded, Base64.DEFAULT)
+                }
+            }
+
+            "true" -> true
+
+            "false" -> false
+
+            "date" -> parser.nextText()
+
+            "array" -> parsePlistArray(parser)
+
+            "dict" -> parsePlistDictionary(parser)
+
+            else -> {
+                throw IllegalArgumentException(
+                    "Unsupported plist element: ${parser.name}"
+                )
+            }
+        }
+    }
+
+    /**
+     * Parses an XML plist array.
+     */
+    private fun parsePlistArray(
+        parser: XmlPullParser
+    ): List<Any?> {
+        val values = mutableListOf<Any?>()
+
+        while (true) {
+            when (parser.next()) {
+                XmlPullParser.START_TAG -> {
+                    values.add(parsePlistElement(parser))
+                }
+
+                XmlPullParser.END_TAG -> {
+                    if (parser.name == "array") {
+                        return values
+                    }
+                }
+
+                XmlPullParser.END_DOCUMENT -> {
+                    throw IllegalStateException(
+                        "Unexpected end of plist array."
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * Parses an XML plist dictionary.
+     */
+    private fun parsePlistDictionary(
+        parser: XmlPullParser
+    ): Map<String, Any?> {
+        val values = linkedMapOf<String, Any?>()
+
+        while (true) {
+            when (parser.next()) {
+                XmlPullParser.START_TAG -> {
+                    if (parser.name != "key") {
+                        throw IllegalArgumentException(
+                            "Expected plist dictionary key."
+                        )
+                    }
+
+                    val key = parser.nextText()
+
+                    var nextEvent = parser.next()
+
+                    while (
+                        nextEvent == XmlPullParser.TEXT &&
+                        parser.isWhitespace
+                    ) {
+                        nextEvent = parser.next()
+                    }
+
+                    if (nextEvent != XmlPullParser.START_TAG) {
+                        throw IllegalArgumentException(
+                            "Missing value for plist key: $key"
+                        )
+                    }
+
+                    values[key] = parsePlistElement(parser)
+                }
+
+                XmlPullParser.END_TAG -> {
+                    if (parser.name == "dict") {
+                        return values
+                    }
+                }
+
+                XmlPullParser.END_DOCUMENT -> {
+                    throw IllegalStateException(
+                        "Unexpected end of plist dictionary."
+                    )
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // LOCKDOWN DEVICE PUBLIC KEY RETRIEVAL
+    // ---------------------------------------------------------
+
+    private suspend fun getDevicePublicKey(
+        connection: UsbMux2TcpConnection
+    ): ByteArray {
+        val request = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+            "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>Label</key>
+                <string>Impactor Android</string>
+                <key>Request</key>
+                <string>GetValue</string>
+                <key>Key</key>
+                <string>DevicePublicKey</string>
+            </dict>
+            </plist>
+        """.trimIndent()
+
+        val response = withContext(Dispatchers.IO) {
+            val result = connection.sendData(
+                data = createLockdownFrame(request),
+                timeoutMs = 7000
+            )
+
+            if (!result.success) {
+                throw IllegalStateException(
+                    "DevicePublicKey request failed: ${result.message}"
+                )
+            }
+
+            receiveLockdownFrame(
+                connection = connection,
+                timeoutMs = 10000
+            )
+        }
+
+        val xml = response.toString(Charsets.UTF_8)
+
+        if (xml.startsWith("bplist00")) {
+            throw IllegalStateException(
+                "DevicePublicKey response is a binary plist. " +
+                    "A binary plist decoder is required."
+            )
+        }
+
+        val publicKey = extractPlistValue(xml, "Value")
+
+        if (publicKey !is ByteArray || publicKey.isEmpty()) {
+            val error = extractPlistValue(xml, "Error")
+
+            throw IllegalStateException(
+                "DevicePublicKey was not returned as binary data. " +
+                    "Response: ${error ?: "Unexpected plist value"}"
+            )
+        }
+
+        return publicKey
     }
 
     // ---------------------------------------------------------
@@ -927,6 +1249,7 @@ class MainActivity : ComponentActivity() {
         frame[3] = length.toByte()
 
         System.arraycopy(payload, 0, frame, 4, payload.size)
+
         return frame
     }
 
@@ -939,12 +1262,12 @@ class MainActivity : ComponentActivity() {
         timeoutMs: Int = 10000
     ): ByteArray {
         val deadline =
-            android.os.SystemClock.elapsedRealtime() + timeoutMs
+            SystemClock.elapsedRealtime() + timeoutMs
 
         val received = ByteArrayOutputStream()
         var expectedLength = -1
 
-        while (android.os.SystemClock.elapsedRealtime() < deadline) {
+        while (SystemClock.elapsedRealtime() < deadline) {
             val result = connection.receiveData(
                 maxBytes = 4096,
                 timeoutMs = 1000
@@ -960,13 +1283,16 @@ class MainActivity : ComponentActivity() {
                         "The iPad closed the Lockdown connection before replying."
                     )
                 }
+
                 continue
             }
 
             received.write(result.data)
 
             if (received.size() > 1_048_580) {
-                throw IllegalStateException("Lockdown response is too large.")
+                throw IllegalStateException(
+                    "Lockdown response is too large."
+                )
             }
 
             val bytes = received.toByteArray()
@@ -987,8 +1313,14 @@ class MainActivity : ComponentActivity() {
                 expectedLength = parsedLength.toInt()
             }
 
-            if (expectedLength > 0 && bytes.size >= 4 + expectedLength) {
-                return bytes.copyOfRange(4, 4 + expectedLength)
+            if (
+                expectedLength > 0 &&
+                bytes.size >= 4 + expectedLength
+            ) {
+                return bytes.copyOfRange(
+                    4,
+                    4 + expectedLength
+                )
             }
         }
 
@@ -1015,7 +1347,8 @@ class MainActivity : ComponentActivity() {
 
         transportInfo.value = "USB transport is closed"
         usbmuxInfo.value = "USBMUX handshake has not been tested."
-        lockdownInfo.value = "Lockdown protocol exchange has not been tested."
+        lockdownInfo.value =
+            "Lockdown protocol exchange has not been tested."
         deviceInfo.value = "No device information retrieved yet."
     }
 
@@ -1052,11 +1385,16 @@ class MainActivity : ComponentActivity() {
                     appendLine(
                         "Bundle ID: ${result.bundleIdentifier ?: "Not parsed"}"
                     )
-                    appendLine("Version: ${result.version ?: "Not parsed"}")
+                    appendLine(
+                        "Version: ${result.version ?: "Not parsed"}"
+                    )
                     appendLine(
                         "Minimum iOS: ${result.minimumOsVersion ?: "Not parsed"}"
                     )
-                    appendLine("Info.plist format: ${result.plistFormat}")
+                    appendLine(
+                        "Info.plist format: ${result.plistFormat}"
+                    )
+
                     result.warnings.forEach {
                         appendLine("Warning: $it")
                     }
@@ -1064,9 +1402,11 @@ class MainActivity : ComponentActivity() {
 
                 operationStatus.value =
                     "IPA archive validated. Signing and installation are not available yet."
+
             } catch (t: Exception) {
                 operationStatus.value =
                     "IPA inspection failed: ${t.message ?: t.javaClass.simpleName}"
+
                 ipaInfo.value = "No valid IPA loaded"
             }
         }
@@ -1083,7 +1423,10 @@ class MainActivity : ComponentActivity() {
         stagedIpa = null
 
         if (receiverRegistered) {
-            runCatching { unregisterReceiver(usbReceiver) }
+            runCatching {
+                unregisterReceiver(usbReceiver)
+            }
+
             receiverRegistered = false
         }
 
@@ -1141,10 +1484,20 @@ private fun Dashboard(
         SectionCard("USB CONNECTION") {
             Text(status)
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = onScan) { Text("Scan USB") }
-                OutlinedButton(onClick = onProbe) { Text("Probe interface") }
-                OutlinedButton(onClick = onCloseTransport) { Text("Close") }
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(onClick = onScan) {
+                    Text("Scan USB")
+                }
+
+                OutlinedButton(onClick = onProbe) {
+                    Text("Probe interface")
+                }
+
+                OutlinedButton(onClick = onCloseTransport) {
+                    Text("Close")
+                }
             }
 
             Text(
@@ -1167,7 +1520,10 @@ private fun Dashboard(
                 Text("Test USBMUX Handshake")
             }
 
-            Text(usbmuxInfo, style = MaterialTheme.typography.bodySmall)
+            Text(
+                usbmuxInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
 
             Button(
                 onClick = onConnectLockdown,
@@ -1176,7 +1532,10 @@ private fun Dashboard(
                 Text("Test Lockdown QueryType")
             }
 
-            Text(lockdownInfo, style = MaterialTheme.typography.bodySmall)
+            Text(
+                lockdownInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
 
             Button(
                 onClick = onGetDeviceInformation,
@@ -1185,7 +1544,10 @@ private fun Dashboard(
                 Text("Get Device Information")
             }
 
-            Text(deviceInfo, style = MaterialTheme.typography.bodySmall)
+            Text(
+                deviceInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
         }
 
         SectionCard("APPLE DEVICES") {
@@ -1196,19 +1558,22 @@ private fun Dashboard(
             devices.forEach { device ->
                 Card(
                     colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surfaceVariant
+                        containerColor =
+                            MaterialTheme.colorScheme.surfaceVariant
                     )
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(5.dp)
+                        verticalArrangement =
+                            Arrangement.spacedBy(5.dp)
                     ) {
                         Text(
                             device.productName ?: "Apple USB device",
                             style = MaterialTheme.typography.titleMedium
                         )
+
                         Text(
                             "VID: %04X  PID: %04X  Device ID: %d".format(
                                 device.vendorId,
@@ -1216,9 +1581,14 @@ private fun Dashboard(
                                 device.deviceId
                             )
                         )
+
                         Text("Interfaces: ${device.interfaceCount}")
 
-                        Button(onClick = { onRequestPermission(device) }) {
+                        Button(
+                            onClick = {
+                                onRequestPermission(device)
+                            }
+                        ) {
                             Text("Request USB permission")
                         }
                     }
@@ -1236,7 +1606,10 @@ private fun Dashboard(
                 Text("Choose IPA file")
             }
 
-            Text(ipaInfo, style = MaterialTheme.typography.bodySmall)
+            Text(
+                ipaInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
 
             OutlinedButton(
                 onClick = onCopyIpa,
@@ -1247,7 +1620,10 @@ private fun Dashboard(
                 Text("Copy IPA Information")
             }
 
-            Text(operationStatus, style = MaterialTheme.typography.bodySmall)
+            Text(
+                operationStatus,
+                style = MaterialTheme.typography.bodySmall
+            )
         }
 
         SectionCard("FEATURE STATUS") {
@@ -1260,6 +1636,8 @@ private fun Dashboard(
             StatusLine("USBMUX2 TCP handshake", true)
             StatusLine("Lockdown QueryType exchange", true)
             StatusLine("Lockdown GetValue requests", true)
+            StatusLine("XML plist data parsing", true)
+            StatusLine("Nested XML plist parsing", true)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
@@ -1290,7 +1668,11 @@ private fun SectionCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(9.dp)
         ) {
-            Text(title, style = MaterialTheme.typography.titleMedium)
+            Text(
+                title,
+                style = MaterialTheme.typography.titleMedium
+            )
+
             content()
         }
     }
@@ -1305,7 +1687,11 @@ private fun StatusLine(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween
     ) {
-        Text(label, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            label,
+            style = MaterialTheme.typography.bodyMedium
+        )
+
         Text(
             if (implemented) "Implemented" else "Pending",
             color = if (implemented) {
