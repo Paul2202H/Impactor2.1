@@ -6,30 +6,14 @@ import android.os.SystemClock
 /**
  * USBMUX2 pseudo-TCP connection.
  *
- * Supports:
- * - USBMUX2 extended packet framing
- * - Directional USBMUX2 magic values
- * - USBMUX2 sequence tracking
- * - TCP SYN / SYN-ACK / ACK handshake
- * - TCP header parsing
- * - TCP payload transmission and reception
- * - Wraparound-safe acknowledgement tracking
- * - Partial TCP acknowledgement handling
- * - Bounded TCP retransmission
- * - Receive-window handling
- * - Incoming payload buffering
- * - Basic FIN/RST handling
- * - Fragmented USB packet buffering
+ * Implements Apple's custom USBMUX2 TCP-like transport.
  *
- * Limitations:
- * - No complete TCP recovery/state machine
- * - No out-of-order payload buffering
- * - No TCP window scaling
- * - No zero-window probing
- * - No congestion control
- * - No SACK support
- * - No Lockdown protocol implementation
- * - No Apple pairing implementation
+ * Important:
+ * - This is NOT a normal TCP implementation.
+ * - TCP checksums are unused.
+ * - TCP windows are scaled by 256.
+ * - The protocol does not use TCP retransmissions.
+ * - USBMUX2 has its own packet sequence numbers.
  */
 class UsbMux2TcpConnection(
     private val transport: AppleUsbTransport,
@@ -82,46 +66,58 @@ class UsbMux2TcpConnection(
         private const val TCP_FIN = 0x01
         private const val TCP_SYN = 0x02
         private const val TCP_RST = 0x04
-        private const val TCP_PSH = 0x08
         private const val TCP_ACK = 0x10
 
-        private const val TCP_WINDOW = 512
+        /*
+         * usbmuxd uses a 131072-byte advertised window.
+         *
+         * The value placed in the TCP window field is shifted
+         * right by 8 bits.
+         */
+        private const val TCP_WINDOW_BYTES = 131072
+        private const val TCP_WINDOW_FIELD =
+            TCP_WINDOW_BYTES shr 8
+
+        /*
+         * Keep individual USBMUX2 data packets small.
+         * The USB transport uses 512-byte bulk endpoints.
+         */
+        private const val MAX_TCP_PAYLOAD = 512
 
         private const val MAX_PACKET_SIZE = 16 * 1024
         private const val MAX_BUFFER_SIZE = MAX_PACKET_SIZE * 2
         private const val MAX_DIAGNOSTIC_BYTES = 256
 
-        private const val MAX_TCP_PAYLOAD = 512
-
-        // TCP retransmission settings.
-        private const val MAX_RETRANSMISSIONS = 4
-        private const val RETRANSMIT_INTERVAL_MS = 700L
+        private const val READ_INTERVAL_MS = 500L
 
         private const val SEQUENCE_MASK = 0xFFFFFFFFL
         private const val SEQUENCE_HALF = 0x80000000L
     }
 
-    // USBMUX2 sequence numbers.
+    // USBMUX2 sequence tracking.
+    //
+    // Setup packet resets tx_seq to 0 and rx_seq to 0xFFFF.
+    // The setup packet consumes sequence 0, so the next packet
+    // starts at sequence 1.
     private var muxTxSequence = 1
     private var muxRxSequence = 0xFFFF
 
-    // TCP sequence numbers.
+    // TCP-like sequence tracking.
     private var tcpTxSequence = 0L
     private var tcpTxAcknowledged = 0L
     private var tcpRxAcknowledgement = 0L
 
-    private var peerWindow = TCP_WINDOW
+    // Peer window is stored in actual bytes, not the raw field.
+    private var peerWindow = TCP_WINDOW_BYTES
 
-    // USB receive buffer.
     private var receiveBuffer = ByteArray(0)
-
-    // Application data waiting to be read.
     private var pendingReceivedData = ByteArray(0)
 
-    // Diagnostics.
     private var lastReceivedPacket = ByteArray(0)
     private var lastReceivedBytes = ByteArray(0)
-    private var lastHeaderControlBits = 0
+
+    private var lastOutgoingSummary = "No outgoing packet."
+    private var lastIncomingSummary = "No incoming packet."
 
     @Volatile
     var isConnected = false
@@ -185,7 +181,8 @@ class UsbMux2TcpConnection(
                     continue
                 }
 
-                val expectedAck = addSequence(tcpTxSequence, 1)
+                val expectedAck =
+                    addSequence(tcpTxSequence, 1)
 
                 if (tcp.acknowledgement != expectedAck) {
                     return failure(
@@ -202,9 +199,9 @@ class UsbMux2TcpConnection(
                 tcpRxAcknowledgement =
                     addSequence(tcp.sequence, 1)
 
-                peerWindow = tcp.window
+                updatePeerWindow(tcp.window)
 
-                // Final handshake ACK.
+                // Complete the SYN / SYN-ACK / ACK handshake.
                 sendTcpPacket(
                     flags = TCP_ACK,
                     sequence = tcpTxSequence,
@@ -215,35 +212,36 @@ class UsbMux2TcpConnection(
 
                 return result(
                     true,
-                    "USBMUX2 pseudo-TCP handshake completed. " +
-                        "Connected to port $remotePort. " +
-                        "Further data exchange still needs validation. " +
-                        "Header control bits: " +
-                        "0x${hexByte(tcp.headerControlBits)}.",
+                    "USBMUX2 connection established. " +
+                        "Remote port: $remotePort. " +
+                        "Peer window: $peerWindow bytes.",
                     indexedHex(packet)
                 )
             }
 
             return result(
                 false,
-                "Timed out waiting for TCP SYN-ACK.",
+                "Timed out waiting for TCP SYN-ACK.\n" +
+                    diagnostics(),
                 diagnosticHex()
             )
 
         } catch (error: Exception) {
+
             isConnected = false
 
             return result(
                 false,
                 "Connection failed: " +
-                    "${error.javaClass.simpleName}: ${error.message}",
+                    "${error.javaClass.simpleName}: ${error.message}\n" +
+                    diagnostics(),
                 diagnosticHex()
             )
         }
     }
 
     // ---------------------------------------------------------
-    // SEND TCP DATA
+    // SEND DATA
     // ---------------------------------------------------------
 
     @Synchronized
@@ -274,8 +272,9 @@ class UsbMux2TcpConnection(
 
         if (tcpTxSequence != tcpTxAcknowledged) {
             return transferFailure(
-                "Previous TCP data is still unacknowledged. " +
-                    "Reconnect before sending more data."
+                "Previous TCP-like data remains unacknowledged. " +
+                    "Reconnect before sending more data.\n" +
+                    diagnostics()
             )
         }
 
@@ -287,25 +286,27 @@ class UsbMux2TcpConnection(
         try {
             while (totalSent < data.size) {
 
-                // Wait for a non-zero peer receive window.
+                // Wait until the peer advertises available space.
                 while (
-                    peerWindow == 0 &&
+                    peerWindow <= 0 &&
                     SystemClock.elapsedRealtime() < deadline
                 ) {
                     val packet = readMuxPacket(deadline) ?: continue
+
                     processIncomingPacket(packet)
 
                     if (!isConnected || isRemoteClosed) {
                         throw IllegalStateException(
-                            "Connection closed while waiting for receive window."
+                            "Connection closed while waiting for peer window."
                         )
                     }
                 }
 
-                if (peerWindow == 0) {
+                if (peerWindow <= 0) {
                     return TransferResult(
                         false,
-                        "Peer receive window remained zero.",
+                        "Peer receive window remained zero.\n" +
+                            diagnostics(),
                         totalSent,
                         diagnosticHex()
                     )
@@ -320,7 +321,8 @@ class UsbMux2TcpConnection(
                 if (chunkSize <= 0) {
                     return TransferResult(
                         false,
-                        "No available TCP send window.",
+                        "No available send window.\n" +
+                            diagnostics(),
                         totalSent,
                         diagnosticHex()
                     )
@@ -338,7 +340,12 @@ class UsbMux2TcpConnection(
                     chunk.size.toLong()
                 )
 
-                // Send original TCP segment.
+                /*
+                 * Send exactly once.
+                 *
+                 * Apple's usbmux transport does not implement
+                 * ordinary TCP retransmission.
+                 */
                 sendTcpPacket(
                     flags = TCP_ACK,
                     sequence = chunkStartSequence,
@@ -346,119 +353,52 @@ class UsbMux2TcpConnection(
                     payload = chunk
                 )
 
-                // Mark segment as outstanding.
                 tcpTxSequence = expectedAck
 
-                var retransmissions = 0
-                var lastTransmission =
-                    SystemClock.elapsedRealtime()
+                var acknowledged = false
 
                 while (
-                    tcpTxAcknowledged != expectedAck &&
                     SystemClock.elapsedRealtime() < deadline
                 ) {
-
                     if (!isConnected || isRemoteClosed) {
                         throw IllegalStateException(
-                            "Connection closed while waiting for TCP acknowledgement."
+                            "Connection closed while waiting for acknowledgement."
                         )
                     }
 
-                    val now = SystemClock.elapsedRealtime()
-
-                    val elapsed = now - lastTransmission
-
-                    val remaining =
-                        RETRANSMIT_INTERVAL_MS - elapsed
-
-                    if (remaining <= 0) {
-
-                        if (retransmissions >= MAX_RETRANSMISSIONS) {
-                            isConnected = false
-
-                            return TransferResult(
-                                false,
-                                "TCP acknowledgement failed after " +
-                                    "$retransmissions retransmissions. " +
-                                    "Expected ACK=$expectedAck, " +
-                                    "received ACK=$tcpTxAcknowledged. " +
-                                    "Connection must be re-established.",
-                                totalSent,
-                                diagnosticHex()
-                            )
-                        }
-
-                        /*
-                         * Determine how much of the segment
-                         * has already been acknowledged.
-                         */
-                        val acknowledgedBytes = sequenceDistance(
-                            chunkStartSequence,
-                            tcpTxAcknowledged
-                        )
-
-                        if (acknowledgedBytes > chunk.size.toLong()) {
-                            throw IllegalStateException(
-                                "TCP acknowledgement advanced beyond " +
-                                    "the current segment."
-                            )
-                        }
-
-                        val remainingOffset =
-                            acknowledgedBytes.toInt()
-
-                        val remainingPayload =
-                            chunk.copyOfRange(
-                                remainingOffset,
-                                chunk.size
-                            )
-
-                        if (remainingPayload.isEmpty()) {
-                            break
-                        }
-
-                        val retransmitSequence = addSequence(
-                            chunkStartSequence,
-                            remainingOffset.toLong()
-                        )
-
-                        // Retransmit only unacknowledged bytes.
-                        sendTcpPacket(
-                            flags = TCP_ACK,
-                            sequence = retransmitSequence,
-                            acknowledgement = tcpRxAcknowledgement,
-                            payload = remainingPayload
-                        )
-
-                        retransmissions++
-
-                        lastTransmission =
-                            SystemClock.elapsedRealtime()
-
-                        continue
+                    if (tcpTxAcknowledged == expectedAck) {
+                        acknowledged = true
+                        break
                     }
 
-                    val readDeadline = minOf(
-                        deadline,
-                        now + remaining
-                    )
-
-                    val packet = readMuxPacket(readDeadline)
+                    val packet = readMuxPacket(deadline)
 
                     if (packet != null) {
                         processIncomingPacket(packet)
                     }
                 }
 
-                if (tcpTxAcknowledged != expectedAck) {
+                if (!acknowledged &&
+                    tcpTxAcknowledged == expectedAck
+                ) {
+                    acknowledged = true
+                }
+
+                if (!acknowledged) {
+
                     isConnected = false
 
                     return TransferResult(
                         false,
-                        "TCP acknowledgement timeout. " +
-                            "Expected ACK=$expectedAck, " +
-                            "received ACK=$tcpTxAcknowledged. " +
-                            "Connection must be re-established.",
+                        "USBMUX2 data acknowledgement timeout.\n" +
+                            "Segment start: $chunkStartSequence\n" +
+                            "Segment size: ${chunk.size}\n" +
+                            "Expected ACK: $expectedAck\n" +
+                            "Received ACK: $tcpTxAcknowledged\n" +
+                            "Unacknowledged bytes: " +
+                            "${sequenceDistance(tcpTxAcknowledged, expectedAck)}\n\n" +
+                            diagnostics() +
+                            "\nConnection must be re-established.",
                         totalSent,
                         diagnosticHex()
                     )
@@ -469,7 +409,9 @@ class UsbMux2TcpConnection(
 
             return TransferResult(
                 true,
-                "All TCP data was acknowledged by the device.",
+                "All data was acknowledged.\n" +
+                    "Bytes sent: $totalSent\n" +
+                    diagnostics(),
                 totalSent,
                 diagnosticHex()
             )
@@ -478,8 +420,9 @@ class UsbMux2TcpConnection(
 
             return TransferResult(
                 false,
-                "TCP send failed: " +
-                    "${error.javaClass.simpleName}: ${error.message}",
+                "USBMUX2 send failed: " +
+                    "${error.javaClass.simpleName}: ${error.message}\n" +
+                    diagnostics(),
                 totalSent,
                 diagnosticHex()
             )
@@ -487,7 +430,7 @@ class UsbMux2TcpConnection(
     }
 
     // ---------------------------------------------------------
-    // RECEIVE TCP DATA
+    // RECEIVE DATA
     // ---------------------------------------------------------
 
     @Synchronized
@@ -516,6 +459,7 @@ class UsbMux2TcpConnection(
                 !isRemoteClosed
             ) {
                 val packet = readMuxPacket(deadline) ?: continue
+
                 processIncomingPacket(packet)
             }
 
@@ -552,9 +496,11 @@ class UsbMux2TcpConnection(
             )
 
         } catch (error: Exception) {
+
             return ReceiveResult(
                 false,
-                "TCP receive failed: ${error.message}"
+                "TCP receive failed: ${error.message}\n" +
+                    diagnostics()
             )
         }
     }
@@ -572,6 +518,7 @@ class UsbMux2TcpConnection(
         val tcp = parseTcpPacket(packet) ?: return
 
         if ((tcp.flags and TCP_RST) != 0) {
+
             isConnected = false
             isRemoteClosed = true
 
@@ -580,7 +527,7 @@ class UsbMux2TcpConnection(
             )
         }
 
-        peerWindow = tcp.window
+        updatePeerWindow(tcp.window)
 
         if ((tcp.flags and TCP_ACK) != 0) {
             updateTcpAcknowledgement(
@@ -604,9 +551,8 @@ class UsbMux2TcpConnection(
                 shouldSendAck = true
 
             } else {
-                // Duplicate or out-of-order data.
+                // Duplicate or out-of-order payload.
                 // Do not append it.
-                // Acknowledge the next expected byte.
                 shouldSendAck = true
             }
         }
@@ -619,11 +565,11 @@ class UsbMux2TcpConnection(
             )
 
             if (finSequence == tcpRxAcknowledgement) {
-                tcpRxAcknowledgement =
-                    addSequence(
-                        tcpRxAcknowledgement,
-                        1
-                    )
+
+                tcpRxAcknowledgement = addSequence(
+                    tcpRxAcknowledgement,
+                    1
+                )
 
                 isRemoteClosed = true
             }
@@ -638,6 +584,20 @@ class UsbMux2TcpConnection(
                 acknowledgement = tcpRxAcknowledgement
             )
         }
+    }
+
+    // ---------------------------------------------------------
+    // WINDOW SCALING
+    // ---------------------------------------------------------
+
+    /**
+     * usbmuxd uses a constant 8-bit window scale.
+     *
+     * Convert the raw TCP window field into bytes.
+     */
+    private fun updatePeerWindow(rawWindow: Int) {
+
+        peerWindow = rawWindow shl 8
     }
 
     // ---------------------------------------------------------
@@ -656,8 +616,6 @@ class UsbMux2TcpConnection(
             ack
         )
 
-        // Accept valid cumulative ACK advancement only.
-        // Ignore duplicate, stale, or out-of-range ACKs.
         if (
             advancement > 0 &&
             advancement <= outstanding &&
@@ -732,7 +690,7 @@ class UsbMux2TcpConnection(
             )
         }
 
-        val window = readUInt16BE(
+        val rawWindow = readUInt16BE(
             packet,
             offset + 14
         )
@@ -745,14 +703,18 @@ class UsbMux2TcpConnection(
             packet.size
         )
 
-        lastHeaderControlBits =
-            headerControlBits
+        lastIncomingSummary =
+            "SEQ=$sequence ACK=$acknowledgement " +
+                "FLAGS=0x${hexByte(flags)} " +
+                "RAW_WINDOW=$rawWindow " +
+                "SCALED_WINDOW=${rawWindow shl 8} " +
+                "PAYLOAD=${payload.size}"
 
         return TcpPacket(
             sequence = sequence,
             acknowledgement = acknowledgement,
             flags = flags,
-            window = window,
+            window = rawWindow,
             headerControlBits = headerControlBits,
             payload = payload
         )
@@ -787,12 +749,20 @@ class UsbMux2TcpConnection(
         tcp[12] = 0x50.toByte()
         tcp[13] = flags.toByte()
 
+        /*
+         * Advertise the receive window using the usbmux
+         * 8-bit scaling convention.
+         */
         putUInt16BE(
             tcp,
             14,
-            TCP_WINDOW
+            TCP_WINDOW_FIELD
         )
 
+        /*
+         * TCP checksum and urgent pointer are unused
+         * by the usbmux pseudo-TCP protocol.
+         */
         putUInt16BE(tcp, 16, 0)
         putUInt16BE(tcp, 18, 0)
 
@@ -834,6 +804,10 @@ class UsbMux2TcpConnection(
             muxTxSequence
         )
 
+        /*
+         * Offset 14 is the peer's last acknowledged
+         * USBMUX2 sequence number.
+         */
         putUInt16BE(
             packet,
             14,
@@ -848,6 +822,16 @@ class UsbMux2TcpConnection(
             tcp.size
         )
 
+        lastOutgoingSummary =
+            "MUX_TX=$muxTxSequence " +
+                "MUX_RX=$muxRxSequence " +
+                "TCP_SEQ=$sequence " +
+                "TCP_ACK=$acknowledgement " +
+                "FLAGS=0x${hexByte(flags)} " +
+                "WINDOW=$TCP_WINDOW_FIELD " +
+                "WINDOW_BYTES=$TCP_WINDOW_BYTES " +
+                "PAYLOAD=${payload.size}"
+
         val written = transport.write(
             packet,
             3000
@@ -858,8 +842,6 @@ class UsbMux2TcpConnection(
                 "$written/${packet.size} bytes."
         }
 
-        // Every transmitted USBMUX2 frame gets a new
-        // USBMUX2 sequence number, including retransmissions.
         muxTxSequence =
             (muxTxSequence + 1) and 0xFFFF
     }
@@ -906,8 +888,7 @@ class UsbMux2TcpConnection(
                         receiveBuffer.size
                     )
 
-                    lastReceivedPacket =
-                        packet.copyOf()
+                    lastReceivedPacket = packet.copyOf()
 
                     return packet
                 }
@@ -922,14 +903,11 @@ class UsbMux2TcpConnection(
                 maxBytes = 4096,
                 timeoutMs = minOf(
                     remaining,
-                    500L
+                    READ_INTERVAL_MS
                 ).toInt().coerceAtLeast(1)
             )
 
-            if (
-                chunk != null &&
-                chunk.isNotEmpty()
-            ) {
+            if (chunk != null && chunk.isNotEmpty()) {
 
                 lastReceivedBytes = (
                     lastReceivedBytes + chunk
@@ -961,9 +939,7 @@ class UsbMux2TcpConnection(
         packet: ByteArray
     ) {
 
-        check(
-            packet.size >= MIN_MUX_PACKET_SIZE
-        ) {
+        check(packet.size >= MIN_MUX_PACKET_SIZE) {
             "USBMUX2 packet is too short."
         }
 
@@ -995,8 +971,16 @@ class UsbMux2TcpConnection(
                 "0x${magic.toString(16)}."
         }
 
-        muxRxSequence =
-            readUInt16BE(packet, 14)
+        /*
+         * Incoming USBMUX2 rx_seq is the acknowledgement
+         * of our transmitted USBMUX2 sequence.
+         *
+         * This is intentionally offset 14, not offset 12.
+         */
+        muxRxSequence = readUInt16BE(
+            packet,
+            14
+        )
     }
 
     // ---------------------------------------------------------
@@ -1007,51 +991,60 @@ class UsbMux2TcpConnection(
         sequence: Long,
         amount: Long
     ): Long {
-        return (
-            sequence + amount
-        ) and SEQUENCE_MASK
+
+        return (sequence + amount) and SEQUENCE_MASK
     }
 
     private fun sequenceDistance(
         start: Long,
         end: Long
     ): Long {
-        return (
-            end - start
-        ) and SEQUENCE_MASK
+
+        return (end - start) and SEQUENCE_MASK
     }
 
     // ---------------------------------------------------------
     // DIAGNOSTICS
     // ---------------------------------------------------------
 
-    private fun indexedHex(
-        data: ByteArray
-    ): String {
-
-        if (data.isEmpty()) {
-            return "No bytes."
-        }
+    private fun diagnostics(): String {
 
         return buildString {
 
-            append(
-                "Packet size: ${data.size} bytes\n"
-            )
+            appendLine("=== USBMUX2 DIAGNOSTICS ===")
 
-            data.indices.forEach { index ->
+            appendLine("Connected: $isConnected")
+            appendLine("Remote closed: $isRemoteClosed")
 
-                append(
-                    "%02d: %02X".format(
-                        index,
-                        data[index].toInt() and 0xFF
-                    )
-                )
+            appendLine()
+            appendLine("=== USBMUX2 SEQUENCES ===")
 
-                if (index != data.lastIndex) {
-                    append('\n')
-                }
-            }
+            appendLine("TX sequence: $muxTxSequence")
+            appendLine("RX acknowledgement: $muxRxSequence")
+
+            appendLine()
+            appendLine("=== TCP-LIKE SEQUENCES ===")
+
+            appendLine("TX sequence: $tcpTxSequence")
+            appendLine("TX acknowledged: $tcpTxAcknowledged")
+            appendLine("RX acknowledgement: $tcpRxAcknowledgement")
+
+            appendLine()
+            appendLine("=== WINDOW ===")
+
+            appendLine("Peer window: $peerWindow bytes")
+            appendLine("Advertised window: $TCP_WINDOW_BYTES bytes")
+            appendLine("Advertised field: $TCP_WINDOW_FIELD")
+
+            appendLine()
+            appendLine("=== LAST OUTGOING PACKET ===")
+
+            appendLine(lastOutgoingSummary)
+
+            appendLine()
+            appendLine("=== LAST INCOMING PACKET ===")
+
+            appendLine(lastIncomingSummary)
         }
     }
 
@@ -1075,6 +1068,34 @@ class UsbMux2TcpConnection(
 
             else ->
                 "No response bytes received."
+        }
+    }
+
+    private fun indexedHex(
+        data: ByteArray
+    ): String {
+
+        if (data.isEmpty()) {
+            return "No bytes."
+        }
+
+        return buildString {
+
+            appendLine("Packet size: ${data.size} bytes")
+
+            data.indices.forEach { index ->
+
+                append(
+                    "%02d: %02X".format(
+                        index,
+                        data[index].toInt() and 0xFF
+                    )
+                )
+
+                if (index != data.lastIndex) {
+                    append('\n')
+                }
+            }
         }
     }
 
@@ -1106,7 +1127,9 @@ class UsbMux2TcpConnection(
 
         lastReceivedPacket = ByteArray(0)
         lastReceivedBytes = ByteArray(0)
-        lastHeaderControlBits = 0
+
+        lastOutgoingSummary = "No outgoing packet."
+        lastIncomingSummary = "No incoming packet."
 
         muxTxSequence = 1
         muxRxSequence = 0xFFFF
@@ -1115,7 +1138,7 @@ class UsbMux2TcpConnection(
         tcpTxAcknowledged = 0L
         tcpRxAcknowledgement = 0L
 
-        peerWindow = TCP_WINDOW
+        peerWindow = TCP_WINDOW_BYTES
     }
 
     @Synchronized
@@ -1227,6 +1250,7 @@ class UsbMux2TcpConnection(
     private fun hexByte(
         value: Int
     ): String {
+
         return "%02X".format(value and 0xFF)
     }
 }
