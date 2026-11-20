@@ -265,26 +265,26 @@ class UsbMux2TcpConnection(
 
         while (SystemClock.elapsedRealtime() < deadline) {
 
+            
             if (receiveBuffer.size >= 8) {
 
-                val packetLength =
+                val packetLengthLong =
                     readUInt32BE(receiveBuffer, 4)
 
-                if (packetLength < MIN_PACKET_SIZE ||
-                    packetLength > MAX_PACKET_SIZE
+                if (packetLengthLong < MIN_PACKET_SIZE.toLong() ||
+                    packetLengthLong > MAX_PACKET_SIZE.toLong()
                 ) {
                     throw IllegalStateException(
-                        "Invalid USBMUX2 packet length: $packetLength"
+                        "Invalid USBMUX2 packet length: $packetLengthLong"
                     )
                 }
+
+                val packetLength = packetLengthLong.toInt()
 
                 if (receiveBuffer.size >= packetLength) {
 
                     val packet =
-                        receiveBuffer.copyOfRange(
-                            0,
-                            packetLength
-                        )
+                        receiveBuffer.copyOfRange(0, packetLength)
 
                     receiveBuffer =
                         receiveBuffer.copyOfRange(
@@ -295,6 +295,7 @@ class UsbMux2TcpConnection(
                     return packet
                 }
             }
+
 
             val remaining =
                 deadline - SystemClock.elapsedRealtime()
