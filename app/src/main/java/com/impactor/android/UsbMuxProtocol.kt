@@ -89,7 +89,7 @@ object UsbMuxProtocol {
         if (major == 2) {
             val setupPacket = byteArrayOf(
                 // Protocol: SETUP (1)
-                0, 0, 0, 1,
+                0, 0, 0, 2,
 
                 // Total length: 17
                 0, 0, 0, 17,
