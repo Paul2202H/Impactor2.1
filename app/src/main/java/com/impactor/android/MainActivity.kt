@@ -3,6 +3,8 @@ package com.impactor.android
 
 import android.app.PendingIntent
 import android.content.BroadcastReceiver
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
@@ -11,6 +13,7 @@ import android.hardware.usb.UsbManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -62,6 +65,9 @@ class MainActivity : ComponentActivity() {
         "No installation operation has been run"
     )
 
+    // Retains the complete diagnostic output for copying.
+    private val diagnosticReport = mutableStateOf("")
+
     private var transport: AppleUsbTransport? = null
     private var selectedDevice: UsbDevice? = null
     private var stagedIpa: IpaInspector.Result? = null
@@ -70,6 +76,38 @@ class MainActivity : ComponentActivity() {
 
     private val permissionAction =
         "com.impactor.android.USB_PERMISSION"
+
+    // ---------------------------------------------------------
+    // CLIPBOARD
+    // ---------------------------------------------------------
+
+    private fun copyToClipboard(
+        label: String,
+        content: String
+    ) {
+        if (content.isBlank()) {
+            Toast.makeText(
+                this,
+                "Nothing to copy yet.",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
+        val clipboard =
+            getSystemService(Context.CLIPBOARD_SERVICE)
+                as ClipboardManager
+
+        clipboard.setPrimaryClip(
+            ClipData.newPlainText(label, content)
+        )
+
+        Toast.makeText(
+            this,
+            "$label copied to clipboard",
+            Toast.LENGTH_SHORT
+        ).show()
+    }
 
     // ---------------------------------------------------------
     // USB BROADCAST RECEIVER
@@ -205,14 +243,27 @@ class MainActivity : ComponentActivity() {
                         transportInfo = transportInfo.value,
                         ipaInfo = ipaInfo.value,
                         operationStatus = operationStatus.value,
+                        hasDiagnosticReport =
+                            diagnosticReport.value.isNotBlank(),
 
                         onScan = ::refreshDevices,
-
                         onRequestPermission = ::requestUsbPermission,
-
                         onProbe = ::probeUsbTransport,
-
                         onCloseTransport = ::closeTransport,
+
+                        onCopyDiagnostics = {
+                            copyToClipboard(
+                                "Impactor USB Diagnostics",
+                                diagnosticReport.value
+                            )
+                        },
+
+                        onCopyIpa = {
+                            copyToClipboard(
+                                "Impactor IPA Information",
+                                ipaInfo.value
+                            )
+                        },
 
                         onChooseIpa = {
                             ipaPicker.launch(
@@ -313,6 +364,9 @@ class MainActivity : ComponentActivity() {
 
         closeTransport()
 
+        diagnosticReport.value = ""
+        transportInfo.value = "Running USB diagnostics..."
+
         status.value = "Inspecting Apple usbmux interface..."
 
         lifecycleScope.launch {
@@ -330,6 +384,7 @@ class MainActivity : ComponentActivity() {
                     val report = StringBuilder()
 
                     report.appendLine("USB DEVICE DIAGNOSTICS")
+                    report.appendLine("Date: ${java.util.Date()}")
 
                     report.appendLine(
                         "Product: ${device.productName ?: "Apple device"}"
@@ -343,6 +398,10 @@ class MainActivity : ComponentActivity() {
                     )
 
                     report.appendLine(
+                        "Configuration count: ${device.configurationCount}"
+                    )
+
+                    report.appendLine(
                         "Total interfaces: ${interfaces.size}"
                     )
 
@@ -352,14 +411,14 @@ class MainActivity : ComponentActivity() {
 
                     report.appendLine()
 
-                    // Show all detected interfaces.
-
                     report.appendLine("INTERFACE DESCRIPTORS")
 
                     interfaces.forEachIndexed { index, info ->
 
+                        report.appendLine("Descriptor entry: $index")
+
                         report.appendLine(
-                            "Descriptor entry: $index"
+                            "Configuration: ${info.configurationId}"
                         )
 
                         report.appendLine(
@@ -401,21 +460,16 @@ class MainActivity : ComponentActivity() {
                         report.appendLine()
                     }
 
-                    // Strictly filter Apple usbmux candidates.
-
                     val usbmuxCandidates =
                         candidates.filter { it.isLikelyUsbmux }
 
                     report.appendLine("APPLE USBMUX TEST")
-
                     report.appendLine(
                         "Expected descriptor: FF/FE/02"
                     )
-
                     report.appendLine(
                         "Matching candidates: ${usbmuxCandidates.size}"
                     )
-
                     report.appendLine()
 
                     if (usbmuxCandidates.isEmpty()) {
@@ -442,10 +496,6 @@ class MainActivity : ComponentActivity() {
 
                     try {
 
-                        // IMPORTANT:
-                        // This method only attempts FF/FE/02.
-                        // It does not fall back to interface 0.
-
                         val opened =
                             AppleUsbTransport.openUsbmux(
                                 manager = usbManager,
@@ -454,6 +504,10 @@ class MainActivity : ComponentActivity() {
 
                         report.appendLine(
                             "USBMUX INTERFACE CLAIM: SUCCESS"
+                        )
+
+                        report.appendLine(
+                            "Configuration: ${opened.details.configurationId}"
                         )
 
                         report.appendLine(
@@ -487,19 +541,12 @@ class MainActivity : ComponentActivity() {
                         )
 
                         report.appendLine()
-
-                        report.appendLine(
-                            "USBMUX INTERFACE CLAIMED."
-                        )
-
+                        report.appendLine("USBMUX INTERFACE CLAIMED.")
                         report.appendLine(
                             "Apple usbmux handshake is NOT implemented."
                         )
 
-                        Pair(
-                            opened,
-                            report.toString()
-                        )
+                        Pair(opened, report.toString())
 
                     } catch (e: Exception) {
 
@@ -512,22 +559,17 @@ class MainActivity : ComponentActivity() {
                         )
 
                         report.appendLine()
-
                         report.appendLine(
                             "No fallback to interface 0 was attempted."
                         )
 
-                        Pair(
-                            null,
-                            report.toString()
-                        )
+                        Pair(null, report.toString())
                     }
                 }
 
-                // Return to the main thread before changing UI state.
-
                 transport = result.first
 
+                diagnosticReport.value = result.second
                 transportInfo.value = result.second
 
                 status.value =
@@ -541,10 +583,13 @@ class MainActivity : ComponentActivity() {
 
                 transport = null
 
-                transportInfo.value =
-                    "USB diagnostic failed: ${
-                        t.message ?: t.javaClass.simpleName
-                    }"
+                val errorReport =
+                    "USB DIAGNOSTIC FAILED\n\n" +
+                        "${t.javaClass.simpleName}: " +
+                        (t.message ?: "Unknown error")
+
+                diagnosticReport.value = errorReport
+                transportInfo.value = errorReport
 
                 status.value = "USB diagnostic failed."
             }
@@ -587,11 +632,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                // Remove the previous staged copy only after
-                // the new IPA has been successfully inspected.
-
                 stagedIpa?.stagedFile?.delete()
-
                 stagedIpa = result
 
                 ipaInfo.value = buildString {
@@ -682,10 +723,13 @@ private fun Dashboard(
     transportInfo: String,
     ipaInfo: String,
     operationStatus: String,
+    hasDiagnosticReport: Boolean,
     onScan: () -> Unit,
     onRequestPermission: (UsbDevice) -> Unit,
     onProbe: () -> Unit,
     onCloseTransport: () -> Unit,
+    onCopyDiagnostics: () -> Unit,
+    onCopyIpa: () -> Unit,
     onChooseIpa: () -> Unit
 ) {
 
@@ -732,6 +776,14 @@ private fun Dashboard(
                 transportInfo,
                 style = MaterialTheme.typography.bodySmall
             )
+
+            OutlinedButton(
+                onClick = onCopyDiagnostics,
+                enabled = hasDiagnosticReport,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Copy USB Diagnostic Results")
+            }
         }
 
         SectionCard("APPLE DEVICES") {
@@ -769,9 +821,7 @@ private fun Dashboard(
                             )
                         )
 
-                        Text(
-                            "Interfaces: ${device.interfaceCount}"
-                        )
+                        Text("Interfaces: ${device.interfaceCount}")
 
                         Button(
                             onClick = {
@@ -800,6 +850,15 @@ private fun Dashboard(
                 ipaInfo,
                 style = MaterialTheme.typography.bodySmall
             )
+
+            OutlinedButton(
+                onClick = onCopyIpa,
+                enabled = ipaInfo != "No IPA selected" &&
+                    ipaInfo != "No valid IPA loaded",
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Copy IPA Information")
+            }
 
             Text(
                 operationStatus,
