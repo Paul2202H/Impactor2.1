@@ -2,7 +2,6 @@
 package com.impactor.android
 
 import android.hardware.usb.UsbConstants
-import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
@@ -13,10 +12,11 @@ import java.io.Closeable
 /**
  * Apple USB diagnostic transport.
  *
- * Currently supports:
+ * Supports:
  * - USB configuration inspection
  * - Interface discovery across all configurations
- * - Strict configuration 3 usbmux candidate selection
+ * - Strict configuration 3 usbmux selection
+ * - Explicit configuration activation
  * - Interface claim diagnostics
  * - Bulk endpoint read/write
  *
@@ -42,9 +42,7 @@ class AppleUsbTransport private constructor(
         private const val APPLE_USB_SUBCLASS = 0xFE
         private const val APPLE_USB_PROTOCOL = 0x02
 
-        // Configuration identified from the iPad's sysfs descriptors.
         private const val TARGET_CONFIGURATION_ID = 3
-
         private const val EXPECTED_INPUT_ENDPOINT = 0x85
         private const val EXPECTED_OUTPUT_ENDPOINT = 0x04
 
@@ -118,12 +116,6 @@ class AppleUsbTransport private constructor(
             }
         }
 
-        /**
-         * Inspect every interface in every configuration.
-         *
-         * This is important because UsbDevice.getInterface()
-         * does not provide a reliable way to search all configurations.
-         */
         fun inspectInterfaces(device: UsbDevice): List<InterfaceInfo> {
             val result = mutableListOf<InterfaceInfo>()
 
@@ -174,9 +166,6 @@ class AppleUsbTransport private constructor(
             return result
         }
 
-        /**
-         * Finds candidates across every configuration.
-         */
         fun candidates(device: UsbDevice): List<Candidate> {
             val result = mutableListOf<Candidate>()
 
@@ -235,11 +224,7 @@ class AppleUsbTransport private constructor(
 
                 val direction = if (
                     endpoint.direction == UsbConstants.USB_DIR_IN
-                ) {
-                    "IN"
-                } else {
-                    "OUT"
-                }
+                ) "IN" else "OUT"
 
                 val type = when (endpoint.type) {
                     UsbConstants.USB_ENDPOINT_XFER_BULK -> "BULK"
@@ -257,9 +242,6 @@ class AppleUsbTransport private constructor(
             }
         }
 
-        /**
-         * Complete configuration and interface report.
-         */
         fun inspectDevice(
             manager: UsbManager,
             device: UsbDevice
@@ -340,9 +322,7 @@ class AppleUsbTransport private constructor(
                         .joinToString(" ") { hex(it.toInt()) }
                 )
             } catch (error: Exception) {
-                report.appendLine(
-                    "Diagnostic error: ${error.message}"
-                )
+                report.appendLine("Diagnostic error: ${error.message}")
             } finally {
                 connection.close()
             }
@@ -352,12 +332,6 @@ class AppleUsbTransport private constructor(
             return report.toString()
         }
 
-        /**
-         * Strictly selects configuration 3, interface FF/FE/02,
-         * with the expected bulk endpoint addresses.
-         *
-         * This method does not switch USB configurations.
-         */
         fun openUsbmux(
             manager: UsbManager,
             device: UsbDevice
@@ -366,9 +340,7 @@ class AppleUsbTransport private constructor(
                 "USB permission is missing."
             }
 
-            check(
-                device.vendorId == 0x05AC
-            ) {
+            check(device.vendorId == 0x05AC) {
                 "Selected device is not an Apple USB device."
             }
 
@@ -385,9 +357,7 @@ class AppleUsbTransport private constructor(
 
             check(matching.isNotEmpty()) {
                 buildString {
-                    appendLine(
-                        "The expected usbmux interface was not found."
-                    )
+                    appendLine("The expected usbmux interface was not found.")
                     appendLine(
                         "Expected configuration: $TARGET_CONFIGURATION_ID"
                     )
@@ -421,11 +391,7 @@ class AppleUsbTransport private constructor(
 
             for (candidate in matching) {
                 try {
-                    return openCandidate(
-                        manager,
-                        device,
-                        candidate
-                    )
+                    return openCandidate(manager, device, candidate)
                 } catch (error: Exception) {
                     errors.add(error.message ?: error.toString())
                 }
@@ -433,16 +399,11 @@ class AppleUsbTransport private constructor(
 
             error(
                 "The expected usbmux interface was detected, " +
-                    "but claiming it failed.\n\n" +
+                    "but opening or claiming it failed.\n\n" +
                     errors.joinToString("\n\n")
             )
         }
 
-        /**
-         * Generic diagnostic opening.
-         *
-         * This does not mean the interface is suitable for usbmux.
-         */
         fun open(
             manager: UsbManager,
             device: UsbDevice,
@@ -456,9 +417,7 @@ class AppleUsbTransport private constructor(
             val candidate = candidates(device).getOrNull(candidateIndex)
                 ?: error("No bulk IN/OUT candidate found.")
 
-            check(
-                candidate.isLikelyUsbmux || allowUnverifiedInterface
-            ) {
+            check(candidate.isLikelyUsbmux || allowUnverifiedInterface) {
                 "Selected interface is not FF/FE/02."
             }
 
@@ -480,23 +439,52 @@ class AppleUsbTransport private constructor(
             try {
                 val intf = candidate.usbInterface
 
+                val configuration = (0 until device.configurationCount)
+                    .map { device.getConfiguration(it) }
+                    .firstOrNull { it.id == candidate.configurationId }
+                    ?: error(
+                        "Configuration ${candidate.configurationId} not found."
+                    )
+
                 val diagnostic = StringBuilder()
 
                 diagnostic.appendLine("=== USBMUX CLAIM TEST ===")
                 diagnostic.appendLine("openDevice(): SUCCESS")
                 diagnostic.appendLine(
-                    "Configuration target: ${candidate.configurationId}"
+                    "Target configuration: ${candidate.configurationId}"
+                )
+
+                diagnostic.appendLine()
+                diagnostic.appendLine("Activating USB configuration...")
+
+                val configured = connection.setConfiguration(configuration)
+
+                diagnostic.appendLine(
+                    "setConfiguration(${configuration.id}): $configured"
+                )
+
+                check(configured) {
+                    diagnostic.appendLine(
+                        "Configuration activation failed."
+                    )
+                    diagnostic.toString()
+                }
+
+                diagnostic.appendLine(
+                    "Configuration activated successfully."
                 )
                 diagnostic.appendLine("Interface: ${intf.id}")
                 diagnostic.appendLine(
                     "Alternate setting: ${intf.alternateSetting}"
                 )
+
                 diagnostic.appendLine(
                     "Class/Subclass/Protocol: " +
                         "${hex(intf.interfaceClass)}/" +
                         "${hex(intf.interfaceSubclass)}/" +
                         "${hex(intf.interfaceProtocol)}"
                 )
+
                 diagnostic.appendLine(
                     "Bulk IN: ${hex(candidate.input.address)}"
                 )
@@ -512,17 +500,11 @@ class AppleUsbTransport private constructor(
                 val claimed = connection.claimInterface(intf, true)
 
                 if (!claimed) {
-                    diagnostic.appendLine(
-                        "claimInterface(): FAILED"
-                    )
-                    diagnostic.appendLine(
-                        "Android returned false."
-                    )
+                    diagnostic.appendLine("claimInterface(): FAILED")
+                    diagnostic.appendLine("Android returned false.")
 
                     diagnostic.appendLine()
-                    diagnostic.appendLine(
-                        "=== NATIVE USB DIAGNOSTICS ==="
-                    )
+                    diagnostic.appendLine("=== NATIVE USB DIAGNOSTICS ===")
 
                     val nativeResult = try {
                         NativeUsbDiagnostics.probeClaim(
@@ -534,27 +516,19 @@ class AppleUsbTransport private constructor(
                             "${error.javaClass.simpleName}: " +
                             "${error.message}"
                     } catch (error: LinkageError) {
-                        "Native library unavailable: " +
-                            "${error.message}"
+                        "Native library unavailable: ${error.message}"
                     }
 
                     diagnostic.appendLine(nativeResult)
-
                     diagnostic.appendLine()
                     diagnostic.appendLine(
                         "No fallback interface was attempted."
                     )
 
-                    diagnostic.appendLine(
-                        "The active USB configuration was not changed."
-                    )
-
                     error(diagnostic.toString())
                 }
 
-                diagnostic.appendLine(
-                    "claimInterface(): SUCCESS"
-                )
+                diagnostic.appendLine("claimInterface(): SUCCESS")
 
                 return AppleUsbTransport(
                     connection = connection,
