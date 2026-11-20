@@ -72,5 +72,8 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.4")
     implementation("androidx.core:core-ktx:1.17.0")
 
+    // Apple Lockdown pairing certificate generation
+    implementation("org.bouncycastle:bcpkix-jdk18on:1.87")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
