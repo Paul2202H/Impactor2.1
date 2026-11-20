@@ -736,7 +736,6 @@ class MainActivity : ComponentActivity() {
 
             try {
 
-                // Step 1: Establish the USBMUX2 pseudo-TCP connection.
                 val connectResult = withContext(Dispatchers.IO) {
                     connection.connect(timeoutMs = 7000)
                 }
@@ -771,7 +770,6 @@ class MainActivity : ComponentActivity() {
 
                 lockdownTcp = connection
 
-                // Step 2: Build the Lockdown QueryType plist.
                 val queryTypePlist = """
                     <?xml version="1.0" encoding="UTF-8"?>
                     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -791,7 +789,6 @@ class MainActivity : ComponentActivity() {
                 lockdownInfo.value =
                     "TCP handshake reported success. Sending Lockdown QueryType..."
 
-                // Step 3: Send the length-prefixed plist.
                 val sendResult = withContext(Dispatchers.IO) {
                     connection.sendData(
                         data = requestFrame,
@@ -812,7 +809,6 @@ class MainActivity : ComponentActivity() {
                     return@launch
                 }
 
-                // Step 4: Receive the framed Lockdown response.
                 val responseBytes = withContext(Dispatchers.IO) {
                     receiveLockdownFrame(
                         connection = connection,
@@ -982,17 +978,19 @@ class MainActivity : ComponentActivity() {
 
             if (bytes.size >= 4 && expectedLength == -1) {
 
-                expectedLength =
-                    ((bytes[0].toLong() and 0xFF) shl 24) or
-                    ((bytes[1].toLong() and 0xFF) shl 16) or
-                    ((bytes[2].toLong() and 0xFF) shl 8) or
-                    (bytes[3].toLong() and 0xFF)
+                val parsedLength =
+                    ((bytes[0].toLong() and 0xFFL) shl 24) or
+                    ((bytes[1].toLong() and 0xFFL) shl 16) or
+                    ((bytes[2].toLong() and 0xFFL) shl 8) or
+                    (bytes[3].toLong() and 0xFFL)
 
-                if (expectedLength !in 1..1_048_576) {
+                if (parsedLength !in 1L..1_048_576L) {
                     throw IllegalStateException(
-                        "Invalid Lockdown response length: $expectedLength"
+                        "Invalid Lockdown response length: $parsedLength"
                     )
                 }
+
+                expectedLength = parsedLength.toInt()
             }
 
             if (
@@ -1333,7 +1331,7 @@ private fun Dashboard(
             StatusLine("Apple usbmux interface selection", true)
             StatusLine("USBMUX version negotiation", true)
             StatusLine("USBMUX2 setup packet transmission", true)
-            StatusLine("USBMUX2 TCP handshake test", false)
+            StatusLine("USBMUX2 TCP handshake", false)
             StatusLine("Lockdown QueryType exchange", false)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
