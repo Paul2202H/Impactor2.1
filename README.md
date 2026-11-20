@@ -2,7 +2,7 @@
 
 This is a native Kotlin/Jetpack Compose Android project scaffold and early USB/IPA inspection implementation for the Impactor Android port.
 
-**It is not yet a complete sideloading application. It does not currently pair with iOS, sign IPA files, or install apps. No APK is included.**
+**It is not yet a complete sideloading application. It does not currently pair with iOS, sign IPA files, or install apps.**
 
 ## Included in this revision
 
