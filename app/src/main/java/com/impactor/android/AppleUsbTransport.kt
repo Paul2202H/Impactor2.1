@@ -2,6 +2,7 @@
 package com.impactor.android
 
 import android.hardware.usb.UsbConstants
+import android.hardware.usb.UsbConfiguration
 import android.hardware.usb.UsbDevice
 import android.hardware.usb.UsbDeviceConnection
 import android.hardware.usb.UsbEndpoint
@@ -10,17 +11,16 @@ import android.hardware.usb.UsbManager
 import java.io.Closeable
 
 /**
- * Android USB transport for Apple device diagnostics.
+ * Apple USB diagnostic transport.
  *
- * Current capabilities:
- * - USB device inspection
- * - USB configuration and interface reporting
- * - Raw descriptor inspection
- * - Apple usbmux-like interface detection
- * - USB interface claim diagnostics
+ * Currently supports:
+ * - USB configuration inspection
+ * - Interface discovery across all configurations
+ * - Strict configuration 3 usbmux candidate selection
+ * - Interface claim diagnostics
  * - Bulk endpoint read/write
  *
- * Not implemented yet:
+ * Not yet implemented:
  * - usbmux protocol
  * - Lockdown protocol
  * - Apple pairing
@@ -33,45 +33,26 @@ class AppleUsbTransport private constructor(
     val usbInterface: UsbInterface,
     private val input: UsbEndpoint,
     private val output: UsbEndpoint,
+    val configurationId: Int,
     val isLikelyUsbmux: Boolean
 ) : Closeable {
 
-    data class ProbeResult(
-        val interfaceNumber: Int,
-        val alternateSetting: Int,
-        val interfaceClass: Int,
-        val interfaceSubclass: Int,
-        val interfaceProtocol: Int,
-        val inputEndpoint: Int,
-        val outputEndpoint: Int,
-        val inputMaxPacket: Int,
-        val outputMaxPacket: Int,
-        val isLikelyUsbmux: Boolean
-    )
-
-    val details = ProbeResult(
-        interfaceNumber = usbInterface.id,
-        alternateSetting = usbInterface.alternateSetting,
-        interfaceClass = usbInterface.interfaceClass,
-        interfaceSubclass = usbInterface.interfaceSubclass,
-        interfaceProtocol = usbInterface.interfaceProtocol,
-        inputEndpoint = input.address,
-        outputEndpoint = output.address,
-        inputMaxPacket = input.maxPacketSize,
-        outputMaxPacket = output.maxPacketSize,
-        isLikelyUsbmux = isLikelyUsbmux
-    )
-
     companion object {
-
         private const val APPLE_USB_CLASS = 0xFF
         private const val APPLE_USB_SUBCLASS = 0xFE
         private const val APPLE_USB_PROTOCOL = 0x02
 
-        private const val MAX_COMPAT_TRANSFER_SIZE = 16 * 1024
+        // Configuration identified from the iPad's sysfs descriptors.
+        private const val TARGET_CONFIGURATION_ID = 3
+
+        private const val EXPECTED_INPUT_ENDPOINT = 0x85
+        private const val EXPECTED_OUTPUT_ENDPOINT = 0x04
+
+        private const val MAX_TRANSFER_SIZE = 16 * 1024
         private const val MAX_RAW_DESCRIPTOR_BYTES = 1024
 
         data class InterfaceInfo(
+            val configurationId: Int,
             val interfaceNumber: Int,
             val alternateSetting: Int,
             val interfaceClass: Int,
@@ -84,28 +65,26 @@ class AppleUsbTransport private constructor(
         )
 
         data class Candidate(
+            val configurationId: Int,
             val usbInterface: UsbInterface,
             val input: UsbEndpoint,
             val output: UsbEndpoint,
             val isLikelyUsbmux: Boolean
         )
 
-        private fun hex(value: Int): String {
-            return "0x%02X".format(value and 0xFF)
-        }
+        private fun hex(value: Int): String =
+            "0x%02X".format(value and 0xFF)
 
-        private fun matchesUsbmux(
-            intf: UsbInterface
-        ): Boolean {
+        private fun matchesUsbmux(intf: UsbInterface): Boolean {
             return intf.interfaceClass == APPLE_USB_CLASS &&
                 intf.interfaceSubclass == APPLE_USB_SUBCLASS &&
                 intf.interfaceProtocol == APPLE_USB_PROTOCOL
         }
 
         private fun endpointCandidates(
+            configurationId: Int,
             intf: UsbInterface
         ): List<Candidate> {
-
             val inputs = mutableListOf<UsbEndpoint>()
             val outputs = mutableListOf<UsbEndpoint>()
 
@@ -129,6 +108,7 @@ class AppleUsbTransport private constructor(
             return inputs.flatMap { input ->
                 outputs.map { output ->
                     Candidate(
+                        configurationId = configurationId,
                         usbInterface = intf,
                         input = input,
                         output = output,
@@ -138,283 +118,211 @@ class AppleUsbTransport private constructor(
             }
         }
 
-        private fun appendInterfaceReport(
-            report: StringBuilder,
-            intf: UsbInterface,
-            indent: String = ""
-        ) {
-
-            report.appendLine("${indent}Interface number: ${intf.id}")
-            report.appendLine(
-                "${indent}Alternate setting: ${intf.alternateSetting}"
-            )
-            report.appendLine(
-                "${indent}Class/Subclass/Protocol: " +
-                    "${hex(intf.interfaceClass)}/" +
-                    "${hex(intf.interfaceSubclass)}/" +
-                    "${hex(intf.interfaceProtocol)}"
-            )
-            report.appendLine(
-                "${indent}Endpoint count: ${intf.endpointCount}"
-            )
-            report.appendLine(
-                "${indent}Likely usbmux: ${matchesUsbmux(intf)}"
-            )
-
-            if (intf.endpointCount == 0) {
-                report.appendLine("${indent}No endpoints.")
-                return
-            }
-
-            for (index in 0 until intf.endpointCount) {
-                val endpoint = intf.getEndpoint(index)
-
-                val direction = when (endpoint.direction) {
-                    UsbConstants.USB_DIR_IN -> "IN"
-                    UsbConstants.USB_DIR_OUT -> "OUT"
-                    else -> "UNKNOWN"
-                }
-
-                val type = when (endpoint.type) {
-                    UsbConstants.USB_ENDPOINT_XFER_CONTROL -> "CONTROL"
-                    UsbConstants.USB_ENDPOINT_XFER_ISOC -> "ISOCHRONOUS"
-                    UsbConstants.USB_ENDPOINT_XFER_BULK -> "BULK"
-                    UsbConstants.USB_ENDPOINT_XFER_INT -> "INTERRUPT"
-                    else -> "UNKNOWN"
-                }
-
-                report.appendLine(
-                    "${indent}  Endpoint $index: " +
-                        "${hex(endpoint.address)}"
-                )
-                report.appendLine(
-                    "${indent}    Direction: $direction"
-                )
-                report.appendLine(
-                    "${indent}    Type: $type"
-                )
-                report.appendLine(
-                    "${indent}    Max packet size: ${endpoint.maxPacketSize}"
-                )
-            }
-        }
-
         /**
-         * Reports interfaces exposed through UsbDevice.
-         * This is Android's exposed interface list, not a complete
-         * enumeration of every possible USB alternate setting.
+         * Inspect every interface in every configuration.
+         *
+         * This is important because UsbDevice.getInterface()
+         * does not provide a reliable way to search all configurations.
          */
-        fun inspectInterfaces(
-            device: UsbDevice
-        ): List<InterfaceInfo> {
-
+        fun inspectInterfaces(device: UsbDevice): List<InterfaceInfo> {
             val result = mutableListOf<InterfaceInfo>()
 
-            for (index in 0 until device.interfaceCount) {
-                val intf = device.getInterface(index)
+            for (configIndex in 0 until device.configurationCount) {
+                val config = device.getConfiguration(configIndex)
 
-                val bulkIn = mutableListOf<Int>()
-                val bulkOut = mutableListOf<Int>()
+                for (interfaceIndex in 0 until config.interfaceCount) {
+                    val intf = config.getInterface(interfaceIndex)
 
-                for (endpointIndex in 0 until intf.endpointCount) {
-                    val endpoint = intf.getEndpoint(endpointIndex)
+                    val bulkIn = mutableListOf<Int>()
+                    val bulkOut = mutableListOf<Int>()
 
-                    if (endpoint.type != UsbConstants.USB_ENDPOINT_XFER_BULK) {
-                        continue
+                    for (endpointIndex in 0 until intf.endpointCount) {
+                        val endpoint = intf.getEndpoint(endpointIndex)
+
+                        if (endpoint.type !=
+                            UsbConstants.USB_ENDPOINT_XFER_BULK
+                        ) {
+                            continue
+                        }
+
+                        when (endpoint.direction) {
+                            UsbConstants.USB_DIR_IN ->
+                                bulkIn.add(endpoint.address)
+
+                            UsbConstants.USB_DIR_OUT ->
+                                bulkOut.add(endpoint.address)
+                        }
                     }
 
-                    when (endpoint.direction) {
-                        UsbConstants.USB_DIR_IN ->
-                            bulkIn.add(endpoint.address)
-
-                        UsbConstants.USB_DIR_OUT ->
-                            bulkOut.add(endpoint.address)
-                    }
-                }
-
-                result.add(
-                    InterfaceInfo(
-                        interfaceNumber = intf.id,
-                        alternateSetting = intf.alternateSetting,
-                        interfaceClass = intf.interfaceClass,
-                        interfaceSubclass = intf.interfaceSubclass,
-                        interfaceProtocol = intf.interfaceProtocol,
-                        endpointCount = intf.endpointCount,
-                        bulkInEndpoints = bulkIn,
-                        bulkOutEndpoints = bulkOut,
-                        isLikelyUsbmux = matchesUsbmux(intf)
+                    result.add(
+                        InterfaceInfo(
+                            configurationId = config.id,
+                            interfaceNumber = intf.id,
+                            alternateSetting = intf.alternateSetting,
+                            interfaceClass = intf.interfaceClass,
+                            interfaceSubclass = intf.interfaceSubclass,
+                            interfaceProtocol = intf.interfaceProtocol,
+                            endpointCount = intf.endpointCount,
+                            bulkInEndpoints = bulkIn,
+                            bulkOutEndpoints = bulkOut,
+                            isLikelyUsbmux = matchesUsbmux(intf)
+                        )
                     )
-                )
+                }
             }
 
             return result
         }
 
         /**
-         * Finds interfaces with bulk IN and bulk OUT endpoints.
+         * Finds candidates across every configuration.
          */
-        fun candidates(
-            device: UsbDevice
-        ): List<Candidate> {
-
+        fun candidates(device: UsbDevice): List<Candidate> {
             val result = mutableListOf<Candidate>()
 
-            for (index in 0 until device.interfaceCount) {
-                result.addAll(
-                    endpointCandidates(device.getInterface(index))
-                )
+            for (configIndex in 0 until device.configurationCount) {
+                val config = device.getConfiguration(configIndex)
+
+                for (interfaceIndex in 0 until config.interfaceCount) {
+                    val intf = config.getInterface(interfaceIndex)
+
+                    result.addAll(
+                        endpointCandidates(config.id, intf)
+                    )
+                }
             }
 
             return result
                 .distinctBy {
-                    Triple(
+                    listOf(
+                        it.configurationId,
                         it.usbInterface.id,
                         it.usbInterface.alternateSetting,
-                        Pair(
-                            it.input.address,
-                            it.output.address
-                        )
+                        it.input.address,
+                        it.output.address
                     )
                 }
-                .sortedByDescending {
-                    it.isLikelyUsbmux
+                .sortedWith(
+                    compareByDescending<Candidate> {
+                        it.isLikelyUsbmux
+                    }.thenBy {
+                        it.configurationId
+                    }
+                )
+        }
+
+        private fun appendInterfaceReport(
+            report: StringBuilder,
+            configId: Int,
+            intf: UsbInterface
+        ) {
+            report.appendLine("Configuration: $configId")
+            report.appendLine("Interface: ${intf.id}")
+            report.appendLine("Alternate: ${intf.alternateSetting}")
+
+            report.appendLine(
+                "Class/Subclass/Protocol: " +
+                    "${hex(intf.interfaceClass)}/" +
+                    "${hex(intf.interfaceSubclass)}/" +
+                    "${hex(intf.interfaceProtocol)}"
+            )
+
+            report.appendLine("Endpoint count: ${intf.endpointCount}")
+            report.appendLine("Likely usbmux: ${matchesUsbmux(intf)}")
+
+            for (index in 0 until intf.endpointCount) {
+                val endpoint = intf.getEndpoint(index)
+
+                val direction = if (
+                    endpoint.direction == UsbConstants.USB_DIR_IN
+                ) {
+                    "IN"
+                } else {
+                    "OUT"
                 }
+
+                val type = when (endpoint.type) {
+                    UsbConstants.USB_ENDPOINT_XFER_BULK -> "BULK"
+                    UsbConstants.USB_ENDPOINT_XFER_INT -> "INTERRUPT"
+                    UsbConstants.USB_ENDPOINT_XFER_ISOC -> "ISOCHRONOUS"
+                    UsbConstants.USB_ENDPOINT_XFER_CONTROL -> "CONTROL"
+                    else -> "UNKNOWN"
+                }
+
+                report.appendLine(
+                    "  Endpoint: ${hex(endpoint.address)} " +
+                        "$direction $type " +
+                        "packet=${endpoint.maxPacketSize}"
+                )
+            }
         }
 
         /**
-         * Full USB diagnostic report.
-         *
-         * Does not change the device configuration or claim interfaces.
+         * Complete configuration and interface report.
          */
         fun inspectDevice(
             manager: UsbManager,
             device: UsbDevice
         ): String {
-
             check(manager.hasPermission(device)) {
                 "USB permission is missing."
             }
 
             val report = StringBuilder()
 
-            report.appendLine("================================")
-            report.appendLine("       USB DEVICE DIAGNOSTICS")
-            report.appendLine("================================")
+            report.appendLine("=== APPLE USB DIAGNOSTICS ===")
+            report.appendLine("Device: ${device.deviceName}")
+            report.appendLine("VID: ${hex(device.vendorId)}")
+            report.appendLine("PID: ${hex(device.productId)}")
+            report.appendLine(
+                "Configuration count: ${device.configurationCount}"
+            )
 
-            report.appendLine("Device name: ${device.deviceName}")
-            report.appendLine("Device ID: ${device.deviceId}")
-            report.appendLine("Vendor ID: ${hex(device.vendorId)}")
-            report.appendLine("Product ID: ${hex(device.productId)}")
-            report.appendLine("Device class: ${hex(device.deviceClass)}")
-            report.appendLine("Device subclass: ${hex(device.deviceSubclass)}")
-            report.appendLine("Device protocol: ${hex(device.deviceProtocol)}")
-            report.appendLine("Exposed interface count: ${device.interfaceCount}")
-            report.appendLine("Configuration count: ${device.configurationCount}")
-
-            // Configuration-level interface inspection.
-            report.appendLine()
-            report.appendLine("================================")
-            report.appendLine("     CONFIGURATION DESCRIPTORS")
-            report.appendLine("================================")
-
-            if (device.configurationCount == 0) {
-                report.appendLine("No configurations exposed.")
-            }
-
-            for (configIndex in 0 until device.configurationCount) {
-                val config = device.getConfiguration(configIndex)
+            for (index in 0 until device.configurationCount) {
+                val config = device.getConfiguration(index)
 
                 report.appendLine()
-                report.appendLine("Configuration index: $configIndex")
-                report.appendLine("Configuration ID: ${config.id}")
-                report.appendLine("Configuration name: ${config.name}")
+                report.appendLine("=== CONFIGURATION ${config.id} ===")
                 report.appendLine("Interface count: ${config.interfaceCount}")
                 report.appendLine("Max power: ${config.maxPower}")
-                report.appendLine("Self powered: ${config.isSelfPowered}")
-                report.appendLine("Remote wakeup: ${config.isRemoteWakeup}")
-
-                if (config.interfaceCount == 0) {
-                    report.appendLine("No interfaces in this configuration.")
-                }
 
                 for (interfaceIndex in 0 until config.interfaceCount) {
-                    val intf = config.getInterface(interfaceIndex)
-
                     report.appendLine()
-                    report.appendLine(
-                        "Configuration $configIndex, interface $interfaceIndex:"
-                    )
-
                     appendInterfaceReport(
-                        report = report,
-                        intf = intf,
-                        indent = "  "
+                        report,
+                        config.id,
+                        config.getInterface(interfaceIndex)
                     )
                 }
             }
 
-            // Android's exposed UsbDevice interface list.
             report.appendLine()
-            report.appendLine("================================")
-            report.appendLine("    ANDROID EXPOSED INTERFACES")
-            report.appendLine("================================")
+            report.appendLine("=== USBMUX CANDIDATES ===")
 
-            for (index in 0 until device.interfaceCount) {
-                report.appendLine()
-                report.appendLine("Exposed interface entry: $index")
-
-                appendInterfaceReport(
-                    report = report,
-                    intf = device.getInterface(index)
-                )
+            val matching = candidates(device).filter {
+                it.isLikelyUsbmux
             }
 
-            // Matching candidates.
-            val matching = candidates(device)
-                .filter { it.isLikelyUsbmux }
-
-            report.appendLine()
-            report.appendLine("================================")
-            report.appendLine("       APPLE USBMUX ANALYSIS")
-            report.appendLine("================================")
-            report.appendLine("Expected descriptor: FF/FE/02")
             report.appendLine("Matching candidates: ${matching.size}")
 
-            for ((index, candidate) in matching.withIndex()) {
-                report.appendLine()
-                report.appendLine("Candidate $index:")
+            for (candidate in matching) {
                 report.appendLine(
-                    "Interface: ${candidate.usbInterface.id}"
+                    "Configuration ${candidate.configurationId}, " +
+                        "interface ${candidate.usbInterface.id}"
                 )
                 report.appendLine(
-                    "Alternate: ${candidate.usbInterface.alternateSetting}"
-                )
-                report.appendLine(
-                    "Bulk IN: ${hex(candidate.input.address)}"
-                )
-                report.appendLine(
-                    "Bulk OUT: ${hex(candidate.output.address)}"
-                )
-                report.appendLine(
-                    "IN max packet: ${candidate.input.maxPacketSize}"
-                )
-                report.appendLine(
-                    "OUT max packet: ${candidate.output.maxPacketSize}"
+                    "IN=${hex(candidate.input.address)}, " +
+                        "OUT=${hex(candidate.output.address)}"
                 )
             }
 
             report.appendLine()
-            report.appendLine("================================")
-            report.appendLine("       USB CONNECTION TEST")
-            report.appendLine("================================")
+            report.appendLine("=== USB CONNECTION ===")
 
             val connection = manager.openDevice(device)
 
             if (connection == null) {
                 report.appendLine("openDevice(): FAILED")
-                report.appendLine(
-                    "Android could not open the USB device."
-                )
                 return report.toString()
             }
 
@@ -426,208 +334,92 @@ class AppleUsbTransport private constructor(
 
                 val raw = connection.rawDescriptors
 
-                report.appendLine()
-                report.appendLine("================================")
-                report.appendLine("        RAW DESCRIPTORS")
-                report.appendLine("================================")
-
-                if (raw.isEmpty()) {
-                    report.appendLine("No raw descriptors returned.")
-                } else {
-                    report.appendLine("Raw descriptor length: ${raw.size}")
-
-                    val limited = raw.take(MAX_RAW_DESCRIPTOR_BYTES)
-
-                    report.appendLine(
-                        limited.joinToString(" ") {
-                            hex(it.toInt())
-                        }
-                    )
-
-                    if (raw.size > MAX_RAW_DESCRIPTOR_BYTES) {
-                        report.appendLine(
-                            "Output truncated at $MAX_RAW_DESCRIPTOR_BYTES bytes."
-                        )
-                    }
-
-                    report.appendLine()
-                    report.appendLine("Parsed descriptor summary:")
-                    report.appendLine(
-                        parseRawDescriptors(limited.toByteArray())
-                    )
-                }
-
-            } catch (error: Exception) {
-                report.appendLine("Diagnostic exception:")
+                report.appendLine("Raw descriptor length: ${raw.size}")
                 report.appendLine(
-                    "${error.javaClass.simpleName}: ${error.message}"
+                    raw.take(MAX_RAW_DESCRIPTOR_BYTES)
+                        .joinToString(" ") { hex(it.toInt()) }
+                )
+            } catch (error: Exception) {
+                report.appendLine(
+                    "Diagnostic error: ${error.message}"
                 )
             } finally {
                 connection.close()
             }
 
             report.appendLine()
-            report.appendLine("================================")
-            report.appendLine("       DIAGNOSTIC COMPLETE")
-            report.appendLine("================================")
-            report.appendLine(
-                "No USB configuration was changed."
-            )
-            report.appendLine(
-                "No interface was claimed during this inspection."
-            )
-
+            report.appendLine("Inspection did not claim an interface.")
             return report.toString()
         }
 
         /**
-         * Parses standard configuration, interface and endpoint
-         * descriptors from the raw descriptor byte array.
-         */
-        private fun parseRawDescriptors(
-            data: ByteArray
-        ): String {
-
-            val report = StringBuilder()
-            var offset = 0
-
-            while (offset + 1 < data.size) {
-                val length = data[offset].toInt() and 0xFF
-                val type = data[offset + 1].toInt() and 0xFF
-
-                if (length < 2 || offset + length > data.size) {
-                    report.appendLine(
-                        "Invalid or incomplete descriptor at offset $offset"
-                    )
-                    break
-                }
-
-                when (type) {
-                    0x02 -> {
-                        if (length >= 9) {
-                            val totalLength =
-                                (data[offset + 2].toInt() and 0xFF) or
-                                    ((data[offset + 3].toInt() and 0xFF) shl 8)
-
-                            val interfaceCount =
-                                data[offset + 4].toInt() and 0xFF
-
-                            val configurationValue =
-                                data[offset + 5].toInt() and 0xFF
-
-                            report.appendLine("Configuration descriptor:")
-                            report.appendLine("  Offset: $offset")
-                            report.appendLine("  Total length: $totalLength")
-                            report.appendLine(
-                                "  Interface count: $interfaceCount"
-                            )
-                            report.appendLine(
-                                "  Configuration value: $configurationValue"
-                            )
-                        }
-                    }
-
-                    0x04 -> {
-                        if (length >= 9) {
-                            val number =
-                                data[offset + 2].toInt() and 0xFF
-
-                            val alternate =
-                                data[offset + 3].toInt() and 0xFF
-
-                            val endpointCount =
-                                data[offset + 4].toInt() and 0xFF
-
-                            val interfaceClass =
-                                data[offset + 5].toInt() and 0xFF
-
-                            val subclass =
-                                data[offset + 6].toInt() and 0xFF
-
-                            val protocol =
-                                data[offset + 7].toInt() and 0xFF
-
-                            report.appendLine("Interface descriptor:")
-                            report.appendLine("  Number: $number")
-                            report.appendLine("  Alternate: $alternate")
-                            report.appendLine(
-                                "  Endpoint count: $endpointCount"
-                            )
-                            report.appendLine(
-                                "  Class/Subclass/Protocol: " +
-                                    "${hex(interfaceClass)}/" +
-                                    "${hex(subclass)}/" +
-                                    "${hex(protocol)}"
-                            )
-                        }
-                    }
-
-                    0x05 -> {
-                        if (length >= 7) {
-                            val address =
-                                data[offset + 2].toInt() and 0xFF
-
-                            val attributes =
-                                data[offset + 3].toInt() and 0xFF
-
-                            val maxPacket =
-                                (data[offset + 4].toInt() and 0xFF) or
-                                    ((data[offset + 5].toInt() and 0xFF) shl 8)
-
-                            val endpointType = when (attributes and 0x03) {
-                                0 -> "CONTROL"
-                                1 -> "ISOCHRONOUS"
-                                2 -> "BULK"
-                                3 -> "INTERRUPT"
-                                else -> "UNKNOWN"
-                            }
-
-                            report.appendLine("Endpoint descriptor:")
-                            report.appendLine("  Address: ${hex(address)}")
-                            report.appendLine("  Type: $endpointType")
-                            report.appendLine(
-                                "  Max packet size: $maxPacket"
-                            )
-                        }
-                    }
-                }
-
-                offset += length
-            }
-
-            if (report.isEmpty()) {
-                report.appendLine(
-                    "No complete configuration, interface, or endpoint descriptors parsed."
-                )
-            }
-
-            return report.toString()
-        }
-
-        /**
-         * Strict Apple usbmux interface opening.
-         * No generic-interface fallback is permitted.
+         * Strictly selects configuration 3, interface FF/FE/02,
+         * with the expected bulk endpoint addresses.
+         *
+         * This method does not switch USB configurations.
          */
         fun openUsbmux(
             manager: UsbManager,
             device: UsbDevice
         ): AppleUsbTransport {
-
             check(manager.hasPermission(device)) {
-                "USB permission is missing. Request permission and try again."
+                "USB permission is missing."
             }
 
-            val matchingCandidates = candidates(device)
-                .filter { it.isLikelyUsbmux }
+            check(
+                device.vendorId == 0x05AC
+            ) {
+                "Selected device is not an Apple USB device."
+            }
 
-            check(matchingCandidates.isNotEmpty()) {
-                "No Apple usbmux-like interface with bulk IN and bulk OUT " +
-                    "endpoints was found. Expected FF/FE/02."
+            val allCandidates = candidates(device)
+
+            val matching = allCandidates.filter { candidate ->
+                candidate.configurationId == TARGET_CONFIGURATION_ID &&
+                    candidate.isLikelyUsbmux &&
+                    candidate.usbInterface.id == 1 &&
+                    candidate.usbInterface.alternateSetting == 0 &&
+                    candidate.input.address == EXPECTED_INPUT_ENDPOINT &&
+                    candidate.output.address == EXPECTED_OUTPUT_ENDPOINT
+            }
+
+            check(matching.isNotEmpty()) {
+                buildString {
+                    appendLine(
+                        "The expected usbmux interface was not found."
+                    )
+                    appendLine(
+                        "Expected configuration: $TARGET_CONFIGURATION_ID"
+                    )
+                    appendLine("Expected interface: 1")
+                    appendLine("Expected descriptor: FF/FE/02")
+                    appendLine(
+                        "Expected bulk IN: ${hex(EXPECTED_INPUT_ENDPOINT)}"
+                    )
+                    appendLine(
+                        "Expected bulk OUT: ${hex(EXPECTED_OUTPUT_ENDPOINT)}"
+                    )
+                    appendLine()
+                    appendLine("Candidates discovered:")
+
+                    for (candidate in allCandidates) {
+                        appendLine(
+                            "Config=${candidate.configurationId}, " +
+                                "Interface=${candidate.usbInterface.id}, " +
+                                "Descriptor=" +
+                                "${hex(candidate.usbInterface.interfaceClass)}/" +
+                                "${hex(candidate.usbInterface.interfaceSubclass)}/" +
+                                "${hex(candidate.usbInterface.interfaceProtocol)}, " +
+                                "IN=${hex(candidate.input.address)}, " +
+                                "OUT=${hex(candidate.output.address)}"
+                        )
+                    }
+                }
             }
 
             val errors = mutableListOf<String>()
 
-            for ((index, candidate) in matchingCandidates.withIndex()) {
+            for (candidate in matching) {
                 try {
                     return openCandidate(
                         manager,
@@ -635,28 +427,21 @@ class AppleUsbTransport private constructor(
                         candidate
                     )
                 } catch (error: Exception) {
-                    errors.add(
-                        "Candidate $index, interface " +
-                            "${candidate.usbInterface.id}, alternate " +
-                            "${candidate.usbInterface.alternateSetting}:\n" +
-                            (error.message ?: "Unknown error")
-                    )
+                    errors.add(error.message ?: error.toString())
                 }
             }
 
             error(
-                "Apple usbmux-like interface was detected, but Android " +
-                    "could not claim it.\n\n" +
-                    errors.joinToString("\n\n") +
-                    "\n\nNo generic interface fallback was attempted."
+                "The expected usbmux interface was detected, " +
+                    "but claiming it failed.\n\n" +
+                    errors.joinToString("\n\n")
             )
         }
 
         /**
          * Generic diagnostic opening.
          *
-         * This must not be used as a production Apple usbmux connection
-         * unless the selected interface has been independently verified.
+         * This does not mean the interface is suitable for usbmux.
          */
         fun open(
             manager: UsbManager,
@@ -664,67 +449,53 @@ class AppleUsbTransport private constructor(
             candidateIndex: Int = 0,
             allowUnverifiedInterface: Boolean = false
         ): AppleUsbTransport {
-
             check(manager.hasPermission(device)) {
-                "Android USB permission has not been granted."
+                "USB permission is missing."
             }
 
             val candidate = candidates(device).getOrNull(candidateIndex)
-                ?: error(
-                    "No USB interface with bulk IN and bulk OUT endpoints found."
-                )
+                ?: error("No bulk IN/OUT candidate found.")
 
-            check(candidate.isLikelyUsbmux || allowUnverifiedInterface) {
-                "Selected interface does not match FF/FE/02."
+            check(
+                candidate.isLikelyUsbmux || allowUnverifiedInterface
+            ) {
+                "Selected interface is not FF/FE/02."
             }
 
-            return openCandidate(
-                manager,
-                device,
-                candidate
-            )
+            return openCandidate(manager, device, candidate)
         }
 
-        /**
-         * Opens the USB device and tries Android's interface claim.
-         *
-         * Native ioctl probing is diagnostic only. Its result must not
-         * be interpreted as proof of the underlying USB driver state.
-         */
         private fun openCandidate(
             manager: UsbManager,
             device: UsbDevice,
             candidate: Candidate
         ): AppleUsbTransport {
-
             check(manager.hasPermission(device)) {
                 "USB permission is missing."
             }
 
             val connection = manager.openDevice(device)
-                ?: error(
-                    "openDevice() failed. Android could not open the USB device."
-                )
+                ?: error("Android openDevice() failed.")
 
             try {
+                val intf = candidate.usbInterface
+
                 val diagnostic = StringBuilder()
 
-                diagnostic.appendLine("=== CLAIM DIAGNOSTICS ===")
+                diagnostic.appendLine("=== USBMUX CLAIM TEST ===")
                 diagnostic.appendLine("openDevice(): SUCCESS")
                 diagnostic.appendLine(
-                    "File descriptor: ${connection.fileDescriptor}"
+                    "Configuration target: ${candidate.configurationId}"
+                )
+                diagnostic.appendLine("Interface: ${intf.id}")
+                diagnostic.appendLine(
+                    "Alternate setting: ${intf.alternateSetting}"
                 )
                 diagnostic.appendLine(
-                    "Interface: ${candidate.usbInterface.id}"
-                )
-                diagnostic.appendLine(
-                    "Alternate setting: ${candidate.usbInterface.alternateSetting}"
-                )
-                diagnostic.appendLine(
-                    "Descriptor: " +
-                        "${hex(candidate.usbInterface.interfaceClass)}/" +
-                        "${hex(candidate.usbInterface.interfaceSubclass)}/" +
-                        "${hex(candidate.usbInterface.interfaceProtocol)}"
+                    "Class/Subclass/Protocol: " +
+                        "${hex(intf.interfaceClass)}/" +
+                        "${hex(intf.interfaceSubclass)}/" +
+                        "${hex(intf.interfaceProtocol)}"
                 )
                 diagnostic.appendLine(
                     "Bulk IN: ${hex(candidate.input.address)}"
@@ -733,87 +504,66 @@ class AppleUsbTransport private constructor(
                     "Bulk OUT: ${hex(candidate.output.address)}"
                 )
 
-                val rawDescriptors = try {
-                    connection.rawDescriptors
-                } catch (error: Exception) {
-                    diagnostic.appendLine(
-                        "Raw descriptor access failed: ${error.message}"
-                    )
-                    null
-                }
-
-                if (rawDescriptors != null) {
-                    diagnostic.appendLine(
-                        "Raw descriptor bytes: ${rawDescriptors.size}"
-                    )
-                }
-
-                val claimed = connection.claimInterface(
-                    candidate.usbInterface,
-                    true
+                diagnostic.appendLine()
+                diagnostic.appendLine(
+                    "Attempting Android claimInterface()..."
                 )
 
+                val claimed = connection.claimInterface(intf, true)
+
                 if (!claimed) {
-                    diagnostic.appendLine()
-                    diagnostic.appendLine("claimInterface(): FAILED")
                     diagnostic.appendLine(
-                        "Android returned false when claiming the interface."
+                        "claimInterface(): FAILED"
+                    )
+                    diagnostic.appendLine(
+                        "Android returned false."
                     )
 
                     diagnostic.appendLine()
-                    diagnostic.appendLine("=== NATIVE USB DIAGNOSTIC ===")
+                    diagnostic.appendLine(
+                        "=== NATIVE USB DIAGNOSTICS ==="
+                    )
 
                     val nativeResult = try {
                         NativeUsbDiagnostics.probeClaim(
                             connection.fileDescriptor,
-                            candidate.usbInterface.id
+                            intf.id
                         )
                     } catch (error: Exception) {
-                        "Native diagnostic exception: " +
-                            "${error.javaClass.simpleName}: ${error.message}"
+                        "Native exception: " +
+                            "${error.javaClass.simpleName}: " +
+                            "${error.message}"
                     } catch (error: LinkageError) {
                         "Native library unavailable: " +
-                            "${error.javaClass.simpleName}: ${error.message}"
+                            "${error.message}"
                     }
 
                     diagnostic.appendLine(nativeResult)
 
-                    if (rawDescriptors != null) {
-                        diagnostic.appendLine()
-                        diagnostic.appendLine("=== RAW DESCRIPTOR PREVIEW ===")
-
-                        diagnostic.appendLine(
-                            rawDescriptors
-                                .take(MAX_RAW_DESCRIPTOR_BYTES)
-                                .joinToString(" ") {
-                                    hex(it.toInt())
-                                }
-                        )
-                    }
-
                     diagnostic.appendLine()
                     diagnostic.appendLine(
-                        "No generic interface fallback was attempted."
-                    )
-                    diagnostic.appendLine(
-                        "No fallback to interface 0 was attempted."
+                        "No fallback interface was attempted."
                     )
 
                     diagnostic.appendLine(
-                        "Native ioctl results are diagnostic only."
+                        "The active USB configuration was not changed."
                     )
 
-                    throw IllegalStateException(diagnostic.toString())
+                    error(diagnostic.toString())
                 }
+
+                diagnostic.appendLine(
+                    "claimInterface(): SUCCESS"
+                )
 
                 return AppleUsbTransport(
                     connection = connection,
-                    usbInterface = candidate.usbInterface,
+                    usbInterface = intf,
                     input = candidate.input,
                     output = candidate.output,
+                    configurationId = candidate.configurationId,
                     isLikelyUsbmux = candidate.isLikelyUsbmux
                 )
-
             } catch (error: Exception) {
                 connection.close()
                 throw error
@@ -821,19 +571,45 @@ class AppleUsbTransport private constructor(
         }
     }
 
+    data class ProbeResult(
+        val configurationId: Int,
+        val interfaceNumber: Int,
+        val alternateSetting: Int,
+        val interfaceClass: Int,
+        val interfaceSubclass: Int,
+        val interfaceProtocol: Int,
+        val inputEndpoint: Int,
+        val outputEndpoint: Int,
+        val inputMaxPacket: Int,
+        val outputMaxPacket: Int,
+        val isLikelyUsbmux: Boolean
+    )
+
+    val details = ProbeResult(
+        configurationId = configurationId,
+        interfaceNumber = usbInterface.id,
+        alternateSetting = usbInterface.alternateSetting,
+        interfaceClass = usbInterface.interfaceClass,
+        interfaceSubclass = usbInterface.interfaceSubclass,
+        interfaceProtocol = usbInterface.interfaceProtocol,
+        inputEndpoint = input.address,
+        outputEndpoint = output.address,
+        inputMaxPacket = input.maxPacketSize,
+        outputMaxPacket = output.maxPacketSize,
+        isLikelyUsbmux = isLikelyUsbmux
+    )
+
     @Synchronized
     fun write(
         data: ByteArray,
         timeoutMs: Int = 3000
     ): Int {
-
         check(data.isNotEmpty()) {
             "USB write buffer is empty."
         }
 
-        check(data.size <= MAX_COMPAT_TRANSFER_SIZE) {
-            "USB write exceeds the compatibility limit of " +
-                "$MAX_COMPAT_TRANSFER_SIZE bytes."
+        require(data.size <= MAX_TRANSFER_SIZE) {
+            "USB write exceeds $MAX_TRANSFER_SIZE bytes."
         }
 
         return connection.bulkTransfer(
@@ -846,13 +622,11 @@ class AppleUsbTransport private constructor(
 
     @Synchronized
     fun read(
-        maxBytes: Int = MAX_COMPAT_TRANSFER_SIZE,
+        maxBytes: Int = MAX_TRANSFER_SIZE,
         timeoutMs: Int = 3000
     ): ByteArray? {
-
-        require(maxBytes in 1..MAX_COMPAT_TRANSFER_SIZE) {
-            "Read size must be between 1 and " +
-                "$MAX_COMPAT_TRANSFER_SIZE bytes."
+        require(maxBytes in 1..MAX_TRANSFER_SIZE) {
+            "Read size must be between 1 and $MAX_TRANSFER_SIZE."
         }
 
         val buffer = ByteArray(maxBytes)
