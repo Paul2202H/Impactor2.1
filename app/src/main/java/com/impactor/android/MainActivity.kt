@@ -1,3 +1,4 @@
+
 package com.impactor.android
 
 import android.app.PendingIntent
@@ -775,7 +776,8 @@ class MainActivity : ComponentActivity() {
                 "ProductVersion",
                 "BuildVersion",
                 "ModelNumber",
-                "DeviceClass"
+                "DeviceClass",
+                "DevicePublicKey"
             )
 
             val results = linkedMapOf<String, String>()
@@ -1257,7 +1259,7 @@ private fun Dashboard(
             StatusLine("USBMUX2 setup packet transmission", true)
             StatusLine("USBMUX2 TCP handshake", true)
             StatusLine("Lockdown QueryType exchange", true)
-            StatusLine("Lockdown GetValue requests", false)
+            StatusLine("Lockdown GetValue requests", true)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
