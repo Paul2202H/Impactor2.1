@@ -61,9 +61,11 @@ class MainActivity : ComponentActivity() {
         "USBMUX handshake has not been tested."
     )
 
-    private val ipaInfo = mutableStateOf(
-        "No IPA selected"
+    private val lockdownInfo = mutableStateOf(
+        "Lockdown TCP connection has not been tested."
     )
+
+    private val ipaInfo = mutableStateOf("No IPA selected")
 
     private val operationStatus = mutableStateOf(
         "No installation operation has been run"
@@ -75,7 +77,12 @@ class MainActivity : ComponentActivity() {
     private var selectedDevice: UsbDevice? = null
     private var stagedIpa: IpaInspector.Result? = null
 
+    private var usbmux2Ready = false
+    private var lockdownTcp: UsbMux2TcpConnection? = null
+
     private var receiverRegistered = false
+    private var usbmuxTestRunning = false
+    private var lockdownTestRunning = false
 
     private val permissionAction =
         "com.impactor.android.USB_PERMISSION"
@@ -230,20 +237,18 @@ class MainActivity : ComponentActivity() {
         refreshDevices()
 
         setContent {
-
             MaterialTheme(
                 colorScheme = darkColorScheme()
             ) {
-
                 Surface(
                     modifier = Modifier.fillMaxSize()
                 ) {
-
                     Dashboard(
                         devices = usbDevices.toList(),
                         status = status.value,
                         transportInfo = transportInfo.value,
                         usbmuxInfo = usbmuxInfo.value,
+                        lockdownInfo = lockdownInfo.value,
                         ipaInfo = ipaInfo.value,
                         operationStatus = operationStatus.value,
                         hasDiagnosticReport =
@@ -253,6 +258,7 @@ class MainActivity : ComponentActivity() {
                         onRequestPermission = ::requestUsbPermission,
                         onProbe = ::probeUsbTransport,
                         onUsbMuxHandshake = ::testUsbMuxHandshake,
+                        onConnectLockdown = ::connectLockdown,
                         onCloseTransport = ::closeTransport,
 
                         onCopyDiagnostics = {
@@ -369,7 +375,6 @@ class MainActivity : ComponentActivity() {
         closeTransport()
 
         diagnosticReport.value = ""
-        usbmuxInfo.value = "USBMUX handshake has not been tested."
         transportInfo.value = "Running USB diagnostics..."
         status.value = "Inspecting Apple usbmux interface..."
 
@@ -468,7 +473,6 @@ class MainActivity : ComponentActivity() {
                     report.appendLine()
 
                     if (usbmuxCandidates.isEmpty()) {
-
                         report.appendLine(
                             "RESULT: No Apple usbmux interface with bulk IN and OUT endpoints."
                         )
@@ -535,7 +539,7 @@ class MainActivity : ComponentActivity() {
                         report.appendLine()
                         report.appendLine("USBMUX INTERFACE CLAIMED.")
                         report.appendLine(
-                            "Apple usbmux handshake is NOT implemented."
+                            "USBMUX version negotiation has not been run."
                         )
 
                         Pair(opened, report.toString())
@@ -597,6 +601,18 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        if (usbmuxTestRunning) {
+            status.value = "USBMUX handshake is already running."
+            return
+        }
+
+        if (usbmux2Ready) {
+            status.value =
+                "USBMUX2 version handshake already completed. Test the TCP connection."
+            return
+        }
+
+        usbmuxTestRunning = true
         usbmuxInfo.value = "Sending USBMUX version request..."
         status.value = "Testing Apple USBMUX protocol..."
 
@@ -605,12 +621,14 @@ class MainActivity : ComponentActivity() {
             try {
 
                 val result = withContext(Dispatchers.IO) {
-
                     UsbMuxProtocol.performVersionHandshake(
                         transport = activeTransport,
                         timeoutMs = 5000
                     )
                 }
+
+                usbmux2Ready =
+                    result.success && result.majorVersion == 2
 
                 val report = buildString {
 
@@ -625,9 +643,12 @@ class MainActivity : ComponentActivity() {
                         }.${result.minorVersion ?: "Unknown"}"
                     )
 
+                    appendLine(
+                        "USBMUX2 readiness: $usbmux2Ready"
+                    )
+
                     appendLine()
                     appendLine("RAW RESPONSE:")
-
                     appendLine(
                         result.rawHex.ifBlank {
                             "No response data"
@@ -637,17 +658,21 @@ class MainActivity : ComponentActivity() {
 
                 usbmuxInfo.value = report
 
-                diagnosticReport.value =
-                    diagnosticReport.value + "\n\n" + report
+                diagnosticReport.value +=
+                    "\n\n$report"
 
                 status.value =
-                    if (result.success) {
-                        "USBMUX version negotiation completed. Check the report."
+                    if (usbmux2Ready) {
+                        "USBMUX2 version negotiation completed. TCP transport is not yet verified."
+                    } else if (result.success) {
+                        "USBMUX version received, but USBMUX2 was not negotiated."
                     } else {
                         "USBMUX handshake failed. Check the diagnostic report."
                     }
 
             } catch (e: Exception) {
+
+                usbmux2Ready = false
 
                 val error =
                     "USBMUX TEST ERROR\n" +
@@ -656,6 +681,123 @@ class MainActivity : ComponentActivity() {
                 usbmuxInfo.value = error
                 diagnosticReport.value += "\n\n$error"
                 status.value = "USBMUX test failed."
+
+            } finally {
+                usbmuxTestRunning = false
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
+    // LOCKDOWN TCP CONNECTION TEST
+    // ---------------------------------------------------------
+
+    private fun connectLockdown() {
+
+        val activeTransport = transport
+
+        if (activeTransport == null) {
+            status.value = "Claim the Apple usbmux interface first."
+            return
+        }
+
+        if (!usbmux2Ready) {
+            status.value =
+                "Run a successful USBMUX2 version handshake first."
+            return
+        }
+
+        if (lockdownTestRunning) {
+            status.value = "TCP connection test is already running."
+            return
+        }
+
+        if (lockdownTcp?.isConnected == true) {
+            status.value =
+                "The experimental TCP connection is already established."
+            return
+        }
+
+        lockdownTestRunning = true
+
+        lockdownInfo.value =
+            "Attempting experimental USBMUX2 TCP connection to port 62078..."
+
+        status.value =
+            "Testing USBMUX2 pseudo-TCP connection..."
+
+        lifecycleScope.launch {
+
+            val connection = UsbMux2TcpConnection(
+                transport = activeTransport,
+                remotePort = 62078
+            )
+
+            try {
+
+                val result = withContext(Dispatchers.IO) {
+                    connection.connect(timeoutMs = 7000)
+                }
+
+                val report = buildString {
+
+                    appendLine("APPLE LOCKDOWN TCP TEST")
+                    appendLine("Date: ${java.util.Date()}")
+                    appendLine("Result: ${result.message}")
+                    appendLine("Success: ${result.success}")
+                    appendLine("Local port: ${result.localPort}")
+                    appendLine("Remote port: ${result.remotePort}")
+
+                    appendLine()
+                    appendLine("RAW RESPONSE:")
+
+                    appendLine(
+                        result.rawResponse.ifBlank {
+                            "No TCP response data."
+                        }
+                    )
+
+                    appendLine()
+                    appendLine(
+                        "Lockdown protocol exchange: NOT IMPLEMENTED"
+                    )
+
+                    appendLine(
+                        "Pairing: NOT IMPLEMENTED"
+                    )
+                }
+
+                lockdownInfo.value = report
+
+                if (result.success) {
+                    lockdownTcp = connection
+                    status.value =
+                        "Experimental USBMUX2 TCP handshake reported success."
+                } else {
+                    connection.close()
+                    status.value =
+                        "Experimental TCP connection failed."
+                }
+
+                diagnosticReport.value +=
+                    "\n\n$report"
+
+            } catch (e: Exception) {
+
+                connection.close()
+
+                val error =
+                    "LOCKDOWN TCP TEST ERROR\n" +
+                        "${e.javaClass.simpleName}: ${e.message}"
+
+                lockdownInfo.value = error
+                diagnosticReport.value += "\n\n$error"
+
+                status.value =
+                    "Experimental TCP connection failed."
+
+            } finally {
+                lockdownTestRunning = false
             }
         }
     }
@@ -667,12 +809,26 @@ class MainActivity : ComponentActivity() {
     private fun closeTransport() {
 
         runCatching {
+            lockdownTcp?.close()
+        }
+
+        lockdownTcp = null
+        usbmux2Ready = false
+        usbmuxTestRunning = false
+        lockdownTestRunning = false
+
+        runCatching {
             transport?.close()
         }
 
         transport = null
+
         transportInfo.value = "USB transport is closed"
-        usbmuxInfo.value = "USBMUX handshake has not been tested."
+        usbmuxInfo.value =
+            "USBMUX handshake has not been tested."
+
+        lockdownInfo.value =
+            "Lockdown TCP connection has not been tested."
     }
 
     // ---------------------------------------------------------
@@ -681,14 +837,14 @@ class MainActivity : ComponentActivity() {
 
     private fun inspectIpa(uri: Uri) {
 
-        operationStatus.value = "Copying and inspecting IPA..."
+        operationStatus.value =
+            "Copying and inspecting IPA..."
 
         lifecycleScope.launch {
 
             try {
 
                 val result = withContext(Dispatchers.IO) {
-
                     IpaInspector.inspect(
                         contentResolver,
                         uri,
@@ -786,6 +942,7 @@ private fun Dashboard(
     status: String,
     transportInfo: String,
     usbmuxInfo: String,
+    lockdownInfo: String,
     ipaInfo: String,
     operationStatus: String,
     hasDiagnosticReport: Boolean,
@@ -793,6 +950,7 @@ private fun Dashboard(
     onRequestPermission: (UsbDevice) -> Unit,
     onProbe: () -> Unit,
     onUsbMuxHandshake: () -> Unit,
+    onConnectLockdown: () -> Unit,
     onCloseTransport: () -> Unit,
     onCopyDiagnostics: () -> Unit,
     onCopyIpa: () -> Unit,
@@ -860,6 +1018,18 @@ private fun Dashboard(
 
             Text(
                 usbmuxInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Button(
+                onClick = onConnectLockdown,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Test Lockdown TCP Connection")
+            }
+
+            Text(
+                lockdownInfo,
                 style = MaterialTheme.typography.bodySmall
             )
         }
@@ -950,9 +1120,10 @@ private fun Dashboard(
             StatusLine("Android USB permission", true)
             StatusLine("USB bulk endpoint diagnostics", true)
             StatusLine("Apple usbmux interface selection", true)
-            StatusLine("Apple usbmux version test", false)
-            StatusLine("USBMUX2 setup response validation", false)
-            StatusLine("Pseudo-TCP transport", false)
+            StatusLine("USBMUX version negotiation", true)
+            StatusLine("USBMUX2 setup packet transmission", true)
+            StatusLine("USBMUX2 TCP connection", false)
+            StatusLine("Lockdown protocol exchange", false)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
