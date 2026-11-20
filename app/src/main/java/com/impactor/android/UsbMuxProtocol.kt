@@ -6,7 +6,7 @@ import java.io.ByteArrayOutputStream
 object UsbMuxProtocol {
 
     private const val VERSION_PROTOCOL = 0
-    private const val SETUP_PROTOCOL = 1
+    private const val SETUP_PROTOCOL = 2
     private const val VERSION_PACKET_SIZE = 20
     private const val BASIC_HEADER_SIZE = 8
     private const val MAX_PACKET_SIZE = 4096
