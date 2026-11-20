@@ -10,6 +10,7 @@ import android.os.SystemClock
  * - USBMUX2 extended packet headers
  * - USBMUX sequence tracking
  * - TCP SYN / SYN-ACK / ACK handshake
+ * - Raw USB response diagnostics
  *
  * Not yet implemented:
  * - TCP data transfer
@@ -46,6 +47,7 @@ class UsbMux2TcpConnection(
 
         private const val TCP_WINDOW = 512
         private const val MAX_PACKET_SIZE = 16 * 1024
+        private const val MAX_DIAGNOSTIC_BYTES = 256
     }
 
     private var muxTxSequence = 1
@@ -55,6 +57,10 @@ class UsbMux2TcpConnection(
     private var tcpRxAcknowledgement = 0L
 
     private var receiveBuffer = ByteArray(0)
+
+    // Preserve bytes even when packet parsing fails.
+    private var lastReceivedPacket = ByteArray(0)
+    private var lastReceivedBytes = ByteArray(0)
 
     @Volatile
     var isConnected = false
@@ -75,6 +81,8 @@ class UsbMux2TcpConnection(
         require(timeoutMs > 0)
 
         receiveBuffer = ByteArray(0)
+        lastReceivedPacket = ByteArray(0)
+        lastReceivedBytes = ByteArray(0)
 
         muxTxSequence = 1
         muxRxSequence = 0xFFFF
@@ -98,6 +106,8 @@ class UsbMux2TcpConnection(
                 val packet = readMuxPacket(deadline)
                     ?: continue
 
+                lastReceivedPacket = packet.copyOf()
+
                 if (packet.size < MIN_PACKET_SIZE) {
                     continue
                 }
@@ -110,7 +120,7 @@ class UsbMux2TcpConnection(
 
                 validateMuxHeader(packet)
 
-                // USBMUX2 incoming rx_seq is at offset 14.
+                // Incoming USBMUX2 rx_seq is at offset 14.
                 muxRxSequence = readUInt16BE(packet, 14)
 
                 val tcpOffset = MUX_HEADER_SIZE
@@ -201,7 +211,8 @@ class UsbMux2TcpConnection(
 
             return result(
                 false,
-                "Timed out waiting for the iPad's TCP SYN-ACK response."
+                "Timed out waiting for the iPad's TCP SYN-ACK response.",
+                diagnosticHex()
             )
 
         } catch (error: Exception) {
@@ -211,7 +222,8 @@ class UsbMux2TcpConnection(
             return result(
                 false,
                 "USBMUX2 TCP connection failed: " +
-                    "${error.javaClass.simpleName}: ${error.message}"
+                    "${error.javaClass.simpleName}: ${error.message}",
+                diagnosticHex()
             )
         }
     }
@@ -281,7 +293,8 @@ class UsbMux2TcpConnection(
                     packetLengthLong > MAX_PACKET_SIZE.toLong()
                 ) {
                     throw IllegalStateException(
-                        "Invalid USBMUX2 packet length: $packetLengthLong"
+                        "Invalid USBMUX2 packet length: $packetLengthLong. " +
+                            "Received bytes: ${receiveBuffer.toHex()}"
                     )
                 }
 
@@ -298,6 +311,8 @@ class UsbMux2TcpConnection(
                         packetLength,
                         receiveBuffer.size
                     )
+
+                    lastReceivedPacket = packet.copyOf()
 
                     return packet
                 }
@@ -319,6 +334,10 @@ class UsbMux2TcpConnection(
 
             if (chunk != null && chunk.isNotEmpty()) {
 
+                lastReceivedBytes = (
+                    lastReceivedBytes + chunk
+                ).takeLastBytes(MAX_DIAGNOSTIC_BYTES)
+
                 if (
                     receiveBuffer.size + chunk.size >
                     MAX_PACKET_SIZE * 2
@@ -338,19 +357,56 @@ class UsbMux2TcpConnection(
     private fun validateMuxHeader(packet: ByteArray) {
 
         check(packet.size >= MIN_PACKET_SIZE) {
-            "USBMUX2 packet is too short."
+            "USBMUX2 packet is too short: ${packet.size} bytes. " +
+                "Raw: ${packet.toHex()}"
         }
 
+        val protocol = readUInt32BE(packet, 0)
         val length = readUInt32BE(packet, 4)
         val magic = readUInt32BE(packet, 8)
 
         check(length == packet.size.toLong()) {
-            "USBMUX2 packet length mismatch."
+            "USBMUX2 packet length mismatch. " +
+                "Header=$length Actual=${packet.size}. " +
+                "Raw: ${packet.toHex()}"
         }
 
         check(magic == MUX_MAGIC) {
-            "Invalid USBMUX2 magic value."
+            "Invalid USBMUX2 magic value. " +
+                "Protocol=0x${protocol.toString(16)} " +
+                "Length=$length " +
+                "Magic=0x${magic.toString(16)} " +
+                "Expected=0x${MUX_MAGIC.toString(16)} " +
+                "Raw: ${packet.toHex()}"
         }
+    }
+
+    private fun diagnosticHex(): String {
+
+        return when {
+            lastReceivedPacket.isNotEmpty() ->
+                lastReceivedPacket.toHex()
+
+            lastReceivedBytes.isNotEmpty() ->
+                lastReceivedBytes.toHex()
+
+            receiveBuffer.isNotEmpty() ->
+                receiveBuffer.takeLastBytes(
+                    MAX_DIAGNOSTIC_BYTES
+                ).toHex()
+
+            else ->
+                "No response bytes received."
+        }
+    }
+
+    private fun ByteArray.takeLastBytes(maxBytes: Int): ByteArray {
+        if (size <= maxBytes) return copyOf()
+
+        return copyOfRange(
+            size - maxBytes,
+            size
+        )
     }
 
     private fun result(
@@ -412,6 +468,7 @@ class UsbMux2TcpConnection(
     fun close() {
         isConnected = false
         receiveBuffer = ByteArray(0)
+        lastReceivedPacket = ByteArray(0)
+        lastReceivedBytes = ByteArray(0)
     }
 }
-
