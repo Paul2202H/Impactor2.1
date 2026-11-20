@@ -455,15 +455,12 @@ class MainActivity : ComponentActivity() {
                     interfaces.forEachIndexed { index, info ->
 
                         report.appendLine("Descriptor entry: $index")
-
                         report.appendLine(
                             "Configuration: ${info.configurationId}"
                         )
-
                         report.appendLine(
                             "Interface number: ${info.interfaceNumber}"
                         )
-
                         report.appendLine(
                             "Class/Subclass/Protocol: %02X/%02X/%02X".format(
                                 info.interfaceClass,
@@ -471,11 +468,9 @@ class MainActivity : ComponentActivity() {
                                 info.interfaceProtocol
                             )
                         )
-
                         report.appendLine(
                             "Alternate setting: ${info.alternateSetting}"
                         )
-
                         report.appendLine(
                             "Bulk IN: ${
                                 info.bulkInEndpoints.joinToString {
@@ -483,7 +478,6 @@ class MainActivity : ComponentActivity() {
                                 }.ifEmpty { "None" }
                             }"
                         )
-
                         report.appendLine(
                             "Bulk OUT: ${
                                 info.bulkOutEndpoints.joinToString {
@@ -491,11 +485,9 @@ class MainActivity : ComponentActivity() {
                                 }.ifEmpty { "None" }
                             }"
                         )
-
                         report.appendLine(
                             "Likely usbmux: ${info.isLikelyUsbmux}"
                         )
-
                         report.appendLine()
                     }
 
@@ -506,11 +498,9 @@ class MainActivity : ComponentActivity() {
 
                     report.appendLine("APPLE USBMUX TEST")
                     report.appendLine("Expected descriptor: FF/FE/02")
-
                     report.appendLine(
                         "Matching candidates: ${usbmuxCandidates.size}"
                     )
-
                     report.appendLine()
 
                     if (usbmuxCandidates.isEmpty()) {
@@ -528,11 +518,9 @@ class MainActivity : ComponentActivity() {
                     report.appendLine(
                         "Only matching Apple usbmux interfaces will be attempted."
                     )
-
                     report.appendLine(
                         "Generic interfaces will NOT be used as fallback."
                     )
-
                     report.appendLine()
 
                     try {
@@ -545,19 +533,15 @@ class MainActivity : ComponentActivity() {
                         report.appendLine(
                             "USBMUX INTERFACE CLAIM: SUCCESS"
                         )
-
                         report.appendLine(
                             "Configuration: ${opened.details.configurationId}"
                         )
-
                         report.appendLine(
                             "Interface: ${opened.details.interfaceNumber}"
                         )
-
                         report.appendLine(
                             "Alternate setting: ${opened.details.alternateSetting}"
                         )
-
                         report.appendLine(
                             "Class/Subclass/Protocol: %02X/%02X/%02X".format(
                                 opened.details.interfaceClass,
@@ -565,24 +549,20 @@ class MainActivity : ComponentActivity() {
                                 opened.details.interfaceProtocol
                             )
                         )
-
                         report.appendLine(
                             "Bulk IN: 0x%02X (packet %d)".format(
                                 opened.details.inputEndpoint,
                                 opened.details.inputMaxPacket
                             )
                         )
-
                         report.appendLine(
                             "Bulk OUT: 0x%02X (packet %d)".format(
                                 opened.details.outputEndpoint,
                                 opened.details.outputMaxPacket
                             )
                         )
-
                         report.appendLine()
                         report.appendLine("USBMUX INTERFACE CLAIMED.")
-
                         report.appendLine(
                             "USBMUX version negotiation has not been run."
                         )
@@ -594,13 +574,10 @@ class MainActivity : ComponentActivity() {
                         report.appendLine(
                             "USBMUX INTERFACE CLAIM: FAILED"
                         )
-
                         report.appendLine(
                             e.message ?: e.javaClass.simpleName
                         )
-
                         report.appendLine()
-
                         report.appendLine(
                             "No fallback to interface 0 was attempted."
                         )
@@ -663,12 +640,8 @@ class MainActivity : ComponentActivity() {
         }
 
         usbmuxTestRunning = true
-
-        usbmuxInfo.value =
-            "Sending USBMUX version request..."
-
-        status.value =
-            "Testing Apple USBMUX protocol..."
+        usbmuxInfo.value = "Sending USBMUX version request..."
+        status.value = "Testing Apple USBMUX protocol..."
 
         lifecycleScope.launch {
             try {
@@ -702,7 +675,6 @@ class MainActivity : ComponentActivity() {
 
                     appendLine()
                     appendLine("RAW RESPONSE:")
-
                     appendLine(
                         result.rawHex.ifBlank {
                             "No response data"
@@ -773,10 +745,8 @@ class MainActivity : ComponentActivity() {
         }
 
         lockdownTestRunning = true
-
         lockdownInfo.value =
             "Connecting to Lockdown port 62078..."
-
         status.value =
             "Testing Lockdown TCP and QueryType exchange..."
 
@@ -797,24 +767,13 @@ class MainActivity : ComponentActivity() {
 
                     val report = buildString {
 
-                        appendLine(
-                            "LOCKDOWN TCP CONNECTION FAILED"
-                        )
-
+                        appendLine("LOCKDOWN TCP CONNECTION FAILED")
                         appendLine("Date: ${java.util.Date()}")
                         appendLine(connectResult.message)
-
-                        appendLine(
-                            "Local port: ${connectResult.localPort}"
-                        )
-
-                        appendLine(
-                            "Remote port: ${connectResult.remotePort}"
-                        )
-
+                        appendLine("Local port: ${connectResult.localPort}")
+                        appendLine("Remote port: ${connectResult.remotePort}")
                         appendLine()
                         appendLine("Raw response:")
-
                         appendLine(
                             connectResult.rawResponse.ifBlank {
                                 "No response data"
@@ -870,38 +829,29 @@ class MainActivity : ComponentActivity() {
                         appendLine(
                             "LOCKDOWN TCP DATA TRANSMISSION FAILED"
                         )
-
                         appendLine("Date: ${java.util.Date()}")
                         appendLine()
-
                         appendLine(
                             "TCP connection: ${connection.isConnected}"
                         )
-
                         appendLine(
                             "Remote closed: ${connection.isRemoteClosed}"
                         )
-
                         appendLine(
                             "Local port: ${connectResult.localPort}"
                         )
-
                         appendLine(
                             "Remote port: ${connectResult.remotePort}"
                         )
-
                         appendLine()
                         appendLine("RESULT:")
                         appendLine(sendResult.message)
-
                         appendLine()
                         appendLine(
                             "Bytes transferred: ${sendResult.bytesTransferred}"
                         )
-
                         appendLine()
                         appendLine("RAW TCP RESPONSE:")
-
                         appendLine(
                             sendResult.rawResponse.ifBlank {
                                 "No diagnostic packet available."
@@ -956,30 +906,20 @@ class MainActivity : ComponentActivity() {
                     appendLine(
                         "Response size: ${responseBytes.size} bytes"
                     )
-
-                    appendLine(
-                        "Binary plist: $isBinaryPlist"
-                    )
-
-                    appendLine(
-                        "Type field detected: $hasType"
-                    )
-
+                    appendLine("Binary plist: $isBinaryPlist")
+                    appendLine("Type field detected: $hasType")
                     appendLine()
                     appendLine("RESPONSE:")
 
                     if (isBinaryPlist) {
-
                         appendLine(
                             "Binary plist received. XML text decoding is not applicable."
                         )
-
                         appendLine(
                             responseBytes.joinToString(" ") {
-                                "%02X".format(it)
+                                "%02X".format(it.toInt() and 0xFF)
                             }
                         )
-
                     } else {
                         appendLine(responseText)
                     }
@@ -1013,11 +953,9 @@ class MainActivity : ComponentActivity() {
                 if (connection.isConnected) {
                     lockdownTcp = connection
                 } else {
-
                     withContext(Dispatchers.IO) {
                         connection.close()
                     }
-
                     lockdownTcp = null
                 }
 
@@ -1048,12 +986,8 @@ class MainActivity : ComponentActivity() {
         }
 
         lockdownTestRunning = true
-
-        deviceInfo.value =
-            "Retrieving iPad information..."
-
-        status.value =
-            "Sending Lockdown GetValue requests..."
+        deviceInfo.value = "Retrieving iPad information..."
+        status.value = "Sending Lockdown GetValue requests..."
 
         lifecycleScope.launch {
 
@@ -1157,7 +1091,6 @@ class MainActivity : ComponentActivity() {
                     appendLine(
                         "Connection: Existing Lockdown TCP session"
                     )
-
                     appendLine()
                     appendLine("DEVICE INFORMATION")
                     appendLine()
@@ -1182,15 +1115,11 @@ class MainActivity : ComponentActivity() {
                     appendLine("LOCKDOWN GETVALUE FAILED")
                     appendLine("Date: ${java.util.Date()}")
                     appendLine()
-
                     appendLine(
                         "${e.javaClass.simpleName}: ${e.message}"
                     )
-
                     appendLine()
-                    appendLine(
-                        "Values received before failure:"
-                    )
+                    appendLine("Values received before failure:")
 
                     results.forEach { (key, value) ->
                         appendLine("$key: $value")
@@ -1255,8 +1184,7 @@ class MainActivity : ComponentActivity() {
 
                 // Retrieve the iPad's RSA public key.
 
-                val publicKey =
-                    getDevicePublicKey(connection)
+                val publicKey = getDevicePublicKey(connection)
 
                 pairingInfo.value =
                     "Device public key retrieved. Sending pairing request..."
@@ -1274,10 +1202,105 @@ class MainActivity : ComponentActivity() {
                     )
 
                     if (!sendResult.success) {
-                        throw IllegalStateException(
-                            "Pair request failed: ${sendResult.message}"
-                        )
+
+                        // Try to retrieve data that may already
+                        // have been buffered by the USBMUX2 transport.
+
+                        val bufferedResult = runCatching {
+                            connection.receiveData(
+                                maxBytes = 16384,
+                                timeoutMs = 1000
+                            )
+                        }
+
+                        val bufferedData =
+                            bufferedResult.getOrNull()?.data
+                                ?: ByteArray(0)
+
+                        val bufferedHex =
+                            bufferedData.joinToString(" ") {
+                                "%02X".format(
+                                    it.toInt() and 0xFF
+                                )
+                            }
+
+                        val bufferedAscii =
+                            bufferedData.map { byte ->
+                                val value =
+                                    byte.toInt() and 0xFF
+
+                                if (value in 32..126) {
+                                    value.toChar()
+                                } else {
+                                    '.'
+                                }
+                            }.joinToString("")
+
+                        val pendingDiagnostics =
+                            runCatching {
+                                connection.getPendingDataDiagnostics()
+                            }.getOrElse {
+                                "Unable to retrieve pending-data diagnostics: ${it.message}"
+                            }
+
+                        val diagnostic = buildString {
+
+                            appendLine(
+                                "Pair request acknowledgement failed."
+                            )
+
+                            appendLine()
+                            appendLine("SEND RESULT:")
+                            appendLine(sendResult.message)
+
+                            appendLine()
+                            appendLine("TRANSFER INFORMATION:")
+
+                            appendLine(
+                                "Bytes transferred: ${sendResult.bytesTransferred}"
+                            )
+
+                            appendLine(
+                                "Connection connected: ${connection.isConnected}"
+                            )
+
+                            appendLine(
+                                "Remote closed: ${connection.isRemoteClosed}"
+                            )
+
+                            appendLine()
+                            appendLine(
+                                "BUFFERED RESPONSE SIZE: ${bufferedData.size} bytes"
+                            )
+
+                            appendLine()
+                            appendLine("BUFFERED RESPONSE HEX:")
+
+                            appendLine(
+                                bufferedHex.ifBlank {
+                                    "No data returned by receiveData()."
+                                }
+                            )
+
+                            appendLine()
+                            appendLine("BUFFERED RESPONSE TEXT:")
+
+                            appendLine(
+                                bufferedAscii.ifBlank {
+                                    "No readable data."
+                                }
+                            )
+
+                            appendLine()
+                            appendLine("TRANSPORT DIAGNOSTICS:")
+                            appendLine(pendingDiagnostics)
+                        }
+
+                        throw IllegalStateException(diagnostic)
                     }
+
+                    // The complete request was acknowledged.
+                    // Now wait for the Lockdown response.
 
                     receiveLockdownFrame(
                         connection = connection,
@@ -1302,14 +1325,11 @@ class MainActivity : ComponentActivity() {
                     appendLine("APPLE PAIRING RESULT")
                     appendLine("Date: ${java.util.Date()}")
                     appendLine()
-
                     appendLine("Success: ${result.success}")
                     appendLine("Saved identity: $saved")
                     appendLine()
-
                     appendLine("Message:")
                     appendLine(result.message)
-
                     appendLine()
                     appendLine("Lockdown response:")
                     appendLine(result.response)
@@ -1431,9 +1451,7 @@ class MainActivity : ComponentActivity() {
                         nextEvent = parser.next()
                     }
 
-                    if (
-                        nextEvent != XmlPullParser.START_TAG
-                    ) {
+                    if (nextEvent != XmlPullParser.START_TAG) {
                         return null
                     }
 
@@ -1558,9 +1576,7 @@ class MainActivity : ComponentActivity() {
                         nextEvent = parser.next()
                     }
 
-                    if (
-                        nextEvent != XmlPullParser.START_TAG
-                    ) {
+                    if (nextEvent != XmlPullParser.START_TAG) {
                         throw IllegalArgumentException(
                             "Missing value for plist key: $key"
                         )
@@ -1808,35 +1824,23 @@ class MainActivity : ComponentActivity() {
 
                 appendLine("PUBLIC KEY VALIDATION")
                 appendLine()
-
-                appendLine(
-                    "Received PEM bytes: ${data.size}"
-                )
-
-                appendLine(
-                    "Decoded DER bytes: ${der.size}"
-                )
-
+                appendLine("Received PEM bytes: ${data.size}")
+                appendLine("Decoded DER bytes: ${der.size}")
                 appendLine("PEM format: RSA PUBLIC KEY")
                 appendLine("DER format: PKCS#1")
                 appendLine("Algorithm: ${publicKey.algorithm}")
                 appendLine("Format: ${publicKey.format}")
-
                 appendLine(
                     "RSA key size: ${publicKey.modulus.bitLength()} bits"
                 )
-
                 appendLine(
                     "Public exponent: ${publicKey.publicExponent}"
                 )
-
                 appendLine()
                 appendLine("SHA-256 fingerprint:")
                 appendLine(fingerprint)
-
                 appendLine()
                 appendLine("Key validation: SUCCESS")
-
                 appendLine(
                     "This validates key encoding, not device identity."
                 )
@@ -1852,15 +1856,12 @@ class MainActivity : ComponentActivity() {
 
                 appendLine("PUBLIC KEY VALIDATION FAILED")
                 appendLine("Received bytes: ${data.size}")
-
                 appendLine(
                     "Expected encoding: PKCS#1 RSA PUBLIC KEY"
                 )
-
                 appendLine()
                 appendLine("First 24 bytes:")
                 appendLine(prefix)
-
                 appendLine()
                 appendLine(
                     "Error: ${e.message ?: e.javaClass.simpleName}"
@@ -2064,27 +2065,21 @@ class MainActivity : ComponentActivity() {
                     appendLine(
                         "File size: ${result.sizeBytes / (1024 * 1024)} MiB"
                     )
-
                     appendLine(
                         "App bundle: ${result.appBundlePath ?: "Unknown"}"
                     )
-
                     appendLine(
                         "Display name: ${result.bundleName ?: "Not parsed"}"
                     )
-
                     appendLine(
                         "Bundle ID: ${result.bundleIdentifier ?: "Not parsed"}"
                     )
-
                     appendLine(
                         "Version: ${result.version ?: "Not parsed"}"
                     )
-
                     appendLine(
                         "Minimum iOS: ${result.minimumOsVersion ?: "Not parsed"}"
                     )
-
                     appendLine(
                         "Info.plist format: ${result.plistFormat}"
                     )
@@ -2378,11 +2373,9 @@ private fun Dashboard(
 
             OutlinedButton(
                 onClick = onCopyIpa,
-
                 enabled =
                     ipaInfo != "No IPA selected" &&
                         ipaInfo != "No valid IPA loaded",
-
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Copy IPA Information")
