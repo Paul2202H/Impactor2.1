@@ -47,6 +47,14 @@ android {
         jniLibs {
             useLegacyPackaging = false
         }
+
+        resources {
+            excludes += setOf(
+                "META-INF/LICENSE.md",
+                "META-INF/NOTICE.md",
+                "META-INF/DEPENDENCIES"
+            )
+        }
     }
 
     compileOptions {
