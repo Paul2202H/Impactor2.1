@@ -56,17 +56,39 @@ import java.security.spec.RSAPublicKeySpec
 class MainActivity : ComponentActivity() {
 
     private lateinit var usbManager: UsbManager
+    private lateinit var pairingManager: ApplePairingManager
 
     private val usbDevices = mutableStateListOf<UsbDevice>()
 
-    private val status = mutableStateOf("Scanning for Apple USB devices...")
-    private val transportInfo = mutableStateOf("USB transport is closed")
-    private val usbmuxInfo = mutableStateOf("USBMUX handshake has not been tested.")
-    private val lockdownInfo = mutableStateOf("Lockdown protocol exchange has not been tested.")
-    private val deviceInfo = mutableStateOf("No device information retrieved yet.")
-    private val ipaInfo = mutableStateOf("No IPA selected")
-    private val operationStatus = mutableStateOf("No installation operation has been run")
-    private val diagnosticReport = mutableStateOf("")
+    private val status =
+        mutableStateOf("Scanning for Apple USB devices...")
+
+    private val transportInfo =
+        mutableStateOf("USB transport is closed")
+
+    private val usbmuxInfo =
+        mutableStateOf("USBMUX handshake has not been tested.")
+
+    private val lockdownInfo =
+        mutableStateOf("Lockdown protocol exchange has not been tested.")
+
+    private val deviceInfo =
+        mutableStateOf("No device information retrieved yet.")
+
+    private val ipaInfo =
+        mutableStateOf("No IPA selected")
+
+    private val operationStatus =
+        mutableStateOf("No installation operation has been run")
+
+    private val diagnosticReport =
+        mutableStateOf("")
+
+    private val pairingInfo =
+        mutableStateOf("Apple device has not been paired.")
+
+    private val pairingRunningState =
+        mutableStateOf(false)
 
     private var transport: AppleUsbTransport? = null
     private var selectedDevice: UsbDevice? = null
@@ -79,23 +101,39 @@ class MainActivity : ComponentActivity() {
     private var usbmuxTestRunning = false
     private var lockdownTestRunning = false
 
-    private val permissionAction = "com.impactor.android.USB_PERMISSION"
+    private val permissionAction =
+        "com.impactor.android.USB_PERMISSION"
 
     // ---------------------------------------------------------
     // CLIPBOARD
     // ---------------------------------------------------------
 
-    private fun copyToClipboard(label: String, content: String) {
+    private fun copyToClipboard(
+        label: String,
+        content: String
+    ) {
         if (content.isBlank()) {
-            Toast.makeText(this, "Nothing to copy yet.", Toast.LENGTH_SHORT).show()
+            Toast.makeText(
+                this,
+                "Nothing to copy yet.",
+                Toast.LENGTH_SHORT
+            ).show()
             return
         }
 
         val clipboard =
-            getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+            getSystemService(Context.CLIPBOARD_SERVICE)
+                    as ClipboardManager
 
-        clipboard.setPrimaryClip(ClipData.newPlainText(label, content))
-        Toast.makeText(this, "$label copied to clipboard", Toast.LENGTH_SHORT).show()
+        clipboard.setPrimaryClip(
+            ClipData.newPlainText(label, content)
+        )
+
+        Toast.makeText(
+            this,
+            "$label copied to clipboard",
+            Toast.LENGTH_SHORT
+        ).show()
     }
 
     // ---------------------------------------------------------
@@ -103,9 +141,15 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private val usbReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
+
+        override fun onReceive(
+            context: Context,
+            intent: Intent
+        ) {
             when (intent.action) {
+
                 permissionAction -> {
+
                     val device =
                         if (Build.VERSION.SDK_INT >= 33) {
                             intent.getParcelableExtra(
@@ -114,7 +158,9 @@ class MainActivity : ComponentActivity() {
                             )
                         } else {
                             @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                            intent.getParcelableExtra(
+                                UsbManager.EXTRA_DEVICE
+                            )
                         }
 
                     val granted = intent.getBooleanExtra(
@@ -124,6 +170,7 @@ class MainActivity : ComponentActivity() {
 
                     if (granted && device != null) {
                         selectedDevice = device
+
                         status.value =
                             "USB permission granted. Device is not paired yet."
                     } else {
@@ -140,6 +187,7 @@ class MainActivity : ComponentActivity() {
                 }
 
                 UsbManager.ACTION_USB_DEVICE_DETACHED -> {
+
                     val detached =
                         if (Build.VERSION.SDK_INT >= 33) {
                             intent.getParcelableExtra(
@@ -148,7 +196,9 @@ class MainActivity : ComponentActivity() {
                             )
                         } else {
                             @Suppress("DEPRECATION")
-                            intent.getParcelableExtra(UsbManager.EXTRA_DEVICE)
+                            intent.getParcelableExtra(
+                                UsbManager.EXTRA_DEVICE
+                            )
                         }
 
                     if (
@@ -171,7 +221,9 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private val ipaPicker =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        registerForActivityResult(
+            ActivityResultContracts.OpenDocument()
+        ) { uri ->
             if (uri != null) inspectIpa(uri)
         }
 
@@ -182,7 +234,17 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        usbManager = getSystemService(Context.USB_SERVICE) as UsbManager
+        usbManager =
+            getSystemService(Context.USB_SERVICE) as UsbManager
+
+        pairingManager = ApplePairingManager(this)
+
+        pairingInfo.value =
+            if (pairingManager.hasSavedPairing()) {
+                "Saved pairing identity found. Device pairing has not yet been reverified."
+            } else {
+                "No saved pairing identity."
+            }
 
         val filter = IntentFilter().apply {
             addAction(permissionAction)
@@ -198,11 +260,16 @@ class MainActivity : ComponentActivity() {
         )
 
         receiverRegistered = true
+
         refreshDevices()
 
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme()) {
-                Surface(modifier = Modifier.fillMaxSize()) {
+            MaterialTheme(
+                colorScheme = darkColorScheme()
+            ) {
+                Surface(
+                    modifier = Modifier.fillMaxSize()
+                ) {
                     Dashboard(
                         devices = usbDevices.toList(),
                         status = status.value,
@@ -212,26 +279,34 @@ class MainActivity : ComponentActivity() {
                         deviceInfo = deviceInfo.value,
                         ipaInfo = ipaInfo.value,
                         operationStatus = operationStatus.value,
-                        hasDiagnosticReport = diagnosticReport.value.isNotBlank(),
+                        pairingInfo = pairingInfo.value,
+                        pairingRunning = pairingRunningState.value,
+                        hasDiagnosticReport =
+                            diagnosticReport.value.isNotBlank(),
+
                         onScan = ::refreshDevices,
                         onRequestPermission = ::requestUsbPermission,
                         onProbe = ::probeUsbTransport,
                         onUsbMuxHandshake = ::testUsbMuxHandshake,
                         onConnectLockdown = ::connectLockdown,
                         onGetDeviceInformation = ::getDeviceInformation,
+                        onPairAppleDevice = ::pairAppleDevice,
                         onCloseTransport = ::closeTransport,
+
                         onCopyDiagnostics = {
                             copyToClipboard(
                                 "Impactor USB Diagnostics",
                                 diagnosticReport.value
                             )
                         },
+
                         onCopyIpa = {
                             copyToClipboard(
                                 "Impactor IPA Information",
                                 ipaInfo.value
                             )
                         },
+
                         onChooseIpa = {
                             ipaPicker.launch(
                                 arrayOf(
@@ -252,6 +327,7 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun refreshDevices() {
+
         val found = usbManager.deviceList.values.filter {
             it.vendorId == APPLE_VENDOR_ID
         }
@@ -260,14 +336,20 @@ class MainActivity : ComponentActivity() {
         usbDevices.addAll(found)
 
         if (found.isEmpty()) {
+
             status.value =
                 "No Apple USB device detected. Check your OTG adapter and cable."
+
             selectedDevice = null
             closeTransport()
+
         } else {
+
             if (
                 selectedDevice == null ||
-                found.none { it.deviceId == selectedDevice?.deviceId }
+                found.none {
+                    it.deviceId == selectedDevice?.deviceId
+                }
             ) {
                 selectedDevice = found.first()
             }
@@ -282,6 +364,7 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun requestUsbPermission(device: UsbDevice) {
+
         selectedDevice = device
 
         if (usbManager.hasPermission(device)) {
@@ -289,16 +372,19 @@ class MainActivity : ComponentActivity() {
             return
         }
 
-        val intent = Intent(permissionAction).setPackage(packageName)
+        val intent =
+            Intent(permissionAction).setPackage(packageName)
 
         val pending = PendingIntent.getBroadcast(
             this,
             device.deviceId,
             intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or
+                PendingIntent.FLAG_MUTABLE
         )
 
         usbManager.requestPermission(device, pending)
+
         status.value = "Waiting for Android USB permission..."
     }
 
@@ -307,6 +393,7 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun probeUsbTransport() {
+
         val device = selectedDevice ?: run {
             status.value = "No Apple device selected."
             return
@@ -318,13 +405,16 @@ class MainActivity : ComponentActivity() {
         }
 
         closeTransport()
+
         diagnosticReport.value = ""
         transportInfo.value = "Running USB diagnostics..."
         status.value = "Inspecting Apple usbmux interface..."
 
         lifecycleScope.launch {
             try {
+
                 val result = withContext(Dispatchers.IO) {
+
                     val interfaces =
                         AppleUsbTransport.inspectInterfaces(device)
 
@@ -335,31 +425,45 @@ class MainActivity : ComponentActivity() {
 
                     report.appendLine("USB DEVICE DIAGNOSTICS")
                     report.appendLine("Date: ${java.util.Date()}")
+
                     report.appendLine(
                         "Product: ${device.productName ?: "Apple device"}"
                     )
+
                     report.appendLine(
                         "VID: %04X  PID: %04X".format(
                             device.vendorId,
                             device.productId
                         )
                     )
+
                     report.appendLine(
                         "Configuration count: ${device.configurationCount}"
                     )
-                    report.appendLine("Total interfaces: ${interfaces.size}")
-                    report.appendLine("Bulk candidates: ${candidates.size}")
+
+                    report.appendLine(
+                        "Total interfaces: ${interfaces.size}"
+                    )
+
+                    report.appendLine(
+                        "Bulk candidates: ${candidates.size}"
+                    )
+
                     report.appendLine()
                     report.appendLine("INTERFACE DESCRIPTORS")
 
                     interfaces.forEachIndexed { index, info ->
+
                         report.appendLine("Descriptor entry: $index")
+
                         report.appendLine(
                             "Configuration: ${info.configurationId}"
                         )
+
                         report.appendLine(
                             "Interface number: ${info.interfaceNumber}"
                         )
+
                         report.appendLine(
                             "Class/Subclass/Protocol: %02X/%02X/%02X".format(
                                 info.interfaceClass,
@@ -367,9 +471,11 @@ class MainActivity : ComponentActivity() {
                                 info.interfaceProtocol
                             )
                         )
+
                         report.appendLine(
                             "Alternate setting: ${info.alternateSetting}"
                         )
+
                         report.appendLine(
                             "Bulk IN: ${
                                 info.bulkInEndpoints.joinToString {
@@ -377,6 +483,7 @@ class MainActivity : ComponentActivity() {
                                 }.ifEmpty { "None" }
                             }"
                         )
+
                         report.appendLine(
                             "Bulk OUT: ${
                                 info.bulkOutEndpoints.joinToString {
@@ -384,53 +491,73 @@ class MainActivity : ComponentActivity() {
                                 }.ifEmpty { "None" }
                             }"
                         )
+
                         report.appendLine(
                             "Likely usbmux: ${info.isLikelyUsbmux}"
                         )
+
                         report.appendLine()
                     }
 
                     val usbmuxCandidates =
-                        candidates.filter { it.isLikelyUsbmux }
+                        candidates.filter {
+                            it.isLikelyUsbmux
+                        }
 
                     report.appendLine("APPLE USBMUX TEST")
                     report.appendLine("Expected descriptor: FF/FE/02")
+
                     report.appendLine(
                         "Matching candidates: ${usbmuxCandidates.size}"
                     )
+
                     report.appendLine()
 
                     if (usbmuxCandidates.isEmpty()) {
+
                         report.appendLine(
                             "RESULT: No Apple usbmux interface with bulk IN and OUT endpoints."
                         )
-                        return@withContext Pair(null, report.toString())
+
+                        return@withContext Pair(
+                            null,
+                            report.toString()
+                        )
                     }
 
                     report.appendLine(
                         "Only matching Apple usbmux interfaces will be attempted."
                     )
+
                     report.appendLine(
                         "Generic interfaces will NOT be used as fallback."
                     )
+
                     report.appendLine()
 
                     try {
+
                         val opened = AppleUsbTransport.openUsbmux(
                             manager = usbManager,
                             device = device
                         )
 
-                        report.appendLine("USBMUX INTERFACE CLAIM: SUCCESS")
+                        report.appendLine(
+                            "USBMUX INTERFACE CLAIM: SUCCESS"
+                        )
+
                         report.appendLine(
                             "Configuration: ${opened.details.configurationId}"
                         )
+
                         report.appendLine(
                             "Interface: ${opened.details.interfaceNumber}"
                         )
+
                         report.appendLine(
                             "Alternate setting: ${opened.details.alternateSetting}"
                         )
+
                         report.appendLine(
                             "Class/Subclass/Protocol: %02X/%02X/%02X".format(
                                 opened.details.interfaceClass,
@@ -438,31 +565,42 @@ class MainActivity : ComponentActivity() {
                                 opened.details.interfaceProtocol
                             )
                         )
+
                         report.appendLine(
                             "Bulk IN: 0x%02X (packet %d)".format(
                                 opened.details.inputEndpoint,
                                 opened.details.inputMaxPacket
                             )
                         )
+
                         report.appendLine(
                             "Bulk OUT: 0x%02X (packet %d)".format(
                                 opened.details.outputEndpoint,
                                 opened.details.outputMaxPacket
                             )
                         )
+
                         report.appendLine()
                         report.appendLine("USBMUX INTERFACE CLAIMED.")
+
                         report.appendLine(
                             "USBMUX version negotiation has not been run."
                         )
 
                         Pair(opened, report.toString())
+
                     } catch (e: Exception) {
-                        report.appendLine("USBMUX INTERFACE CLAIM: FAILED")
+
+                        report.appendLine(
+                            "USBMUX INTERFACE CLAIM: FAILED"
+                        )
+
                         report.appendLine(
                             e.message ?: e.javaClass.simpleName
                         )
+
                         report.appendLine()
+
                         report.appendLine(
                             "No fallback to interface 0 was attempted."
                         )
@@ -483,6 +621,7 @@ class MainActivity : ComponentActivity() {
                     }
 
             } catch (t: Exception) {
+
                 transport = null
 
                 val errorReport =
@@ -502,15 +641,18 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun testUsbMuxHandshake() {
+
         val activeTransport = transport
 
         if (activeTransport == null) {
-            status.value = "Claim the Apple usbmux interface first."
+            status.value =
+                "Claim the Apple usbmux interface first."
             return
         }
 
         if (usbmuxTestRunning) {
-            status.value = "USBMUX handshake is already running."
+            status.value =
+                "USBMUX handshake is already running."
             return
         }
 
@@ -521,11 +663,16 @@ class MainActivity : ComponentActivity() {
         }
 
         usbmuxTestRunning = true
-        usbmuxInfo.value = "Sending USBMUX version request..."
-        status.value = "Testing Apple USBMUX protocol..."
+
+        usbmuxInfo.value =
+            "Sending USBMUX version request..."
+
+        status.value =
+            "Testing Apple USBMUX protocol..."
 
         lifecycleScope.launch {
             try {
+
                 val result = withContext(Dispatchers.IO) {
                     UsbMuxProtocol.performVersionHandshake(
                         transport = activeTransport,
@@ -537,20 +684,29 @@ class MainActivity : ComponentActivity() {
                     result.success && result.majorVersion == 2
 
                 val report = buildString {
+
                     appendLine("APPLE USBMUX VERSION TEST")
                     appendLine("Date: ${java.util.Date()}")
                     appendLine("Result: ${result.message}")
                     appendLine("Success: ${result.success}")
+
                     appendLine(
                         "Version: ${
                             result.majorVersion ?: "Unknown"
                         }.${result.minorVersion ?: "Unknown"}"
                     )
-                    appendLine("USBMUX2 readiness: $usbmux2Ready")
+
+                    appendLine(
+                        "USBMUX2 readiness: $usbmux2Ready"
+                    )
+
                     appendLine()
                     appendLine("RAW RESPONSE:")
+
                     appendLine(
-                        result.rawHex.ifBlank { "No response data" }
+                        result.rawHex.ifBlank {
+                            "No response data"
+                        }
                     )
                 }
 
@@ -567,6 +723,7 @@ class MainActivity : ComponentActivity() {
                     }
 
             } catch (e: Exception) {
+
                 usbmux2Ready = false
 
                 val error =
@@ -588,10 +745,12 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun connectLockdown() {
+
         val activeTransport = transport
 
         if (activeTransport == null) {
-            status.value = "Claim the Apple usbmux interface first."
+            status.value =
+                "Claim the Apple usbmux interface first."
             return
         }
 
@@ -602,7 +761,8 @@ class MainActivity : ComponentActivity() {
         }
 
         if (lockdownTestRunning) {
-            status.value = "Lockdown test is already running."
+            status.value =
+                "Lockdown test is already running."
             return
         }
 
@@ -613,29 +773,48 @@ class MainActivity : ComponentActivity() {
         }
 
         lockdownTestRunning = true
-        lockdownInfo.value = "Connecting to Lockdown port 62078..."
-        status.value = "Testing Lockdown TCP and QueryType exchange..."
+
+        lockdownInfo.value =
+            "Connecting to Lockdown port 62078..."
+
+        status.value =
+            "Testing Lockdown TCP and QueryType exchange..."
 
         lifecycleScope.launch {
+
             val connection = UsbMux2TcpConnection(
                 transport = activeTransport,
                 remotePort = 62078
             )
 
             try {
+
                 val connectResult = withContext(Dispatchers.IO) {
                     connection.connect(timeoutMs = 7000)
                 }
 
                 if (!connectResult.success) {
+
                     val report = buildString {
-                        appendLine("LOCKDOWN TCP CONNECTION FAILED")
+
+                        appendLine(
+                            "LOCKDOWN TCP CONNECTION FAILED"
+                        )
+
                         appendLine("Date: ${java.util.Date()}")
                         appendLine(connectResult.message)
-                        appendLine("Local port: ${connectResult.localPort}")
-                        appendLine("Remote port: ${connectResult.remotePort}")
+
+                        appendLine(
+                            "Local port: ${connectResult.localPort}"
+                        )
+
+                        appendLine(
+                            "Remote port: ${connectResult.remotePort}"
+                        )
+
                         appendLine()
                         appendLine("Raw response:")
+
                         appendLine(
                             connectResult.rawResponse.ifBlank {
                                 "No response data"
@@ -650,7 +829,9 @@ class MainActivity : ComponentActivity() {
                         connection.close()
                     }
 
-                    status.value = "Lockdown TCP connection failed."
+                    status.value =
+                        "Lockdown TCP connection failed."
+
                     return@launch
                 }
 
@@ -669,7 +850,8 @@ class MainActivity : ComponentActivity() {
                     </plist>
                 """.trimIndent()
 
-                val requestFrame = createLockdownFrame(queryTypePlist)
+                val requestFrame =
+                    createLockdownFrame(queryTypePlist)
 
                 lockdownInfo.value =
                     "TCP handshake reported success. Sending Lockdown QueryType..."
@@ -682,21 +864,44 @@ class MainActivity : ComponentActivity() {
                 }
 
                 if (!sendResult.success) {
+
                     val report = buildString {
-                        appendLine("LOCKDOWN TCP DATA TRANSMISSION FAILED")
+
+                        appendLine(
+                            "LOCKDOWN TCP DATA TRANSMISSION FAILED"
+                        )
+
                         appendLine("Date: ${java.util.Date()}")
                         appendLine()
-                        appendLine("TCP connection: ${connection.isConnected}")
-                        appendLine("Remote closed: ${connection.isRemoteClosed}")
-                        appendLine("Local port: ${connectResult.localPort}")
-                        appendLine("Remote port: ${connectResult.remotePort}")
+
+                        appendLine(
+                            "TCP connection: ${connection.isConnected}"
+                        )
+
+                        appendLine(
+                            "Remote closed: ${connection.isRemoteClosed}"
+                        )
+
+                        appendLine(
+                            "Local port: ${connectResult.localPort}"
+                        )
+
+                        appendLine(
+                            "Remote port: ${connectResult.remotePort}"
+                        )
+
                         appendLine()
                         appendLine("RESULT:")
                         appendLine(sendResult.message)
+
                         appendLine()
-                        appendLine("Bytes transferred: ${sendResult.bytesTransferred}")
+                        appendLine(
+                            "Bytes transferred: ${sendResult.bytesTransferred}"
+                        )
+
                         appendLine()
                         appendLine("RAW TCP RESPONSE:")
+
                         appendLine(
                             sendResult.rawResponse.ifBlank {
                                 "No diagnostic packet available."
@@ -728,7 +933,8 @@ class MainActivity : ComponentActivity() {
                     )
                 }
 
-                val responseText = responseBytes.toString(Charsets.UTF_8)
+                val responseText =
+                    responseBytes.toString(Charsets.UTF_8)
 
                 val isBinaryPlist =
                     responseBytes.size >= 8 &&
@@ -741,26 +947,39 @@ class MainActivity : ComponentActivity() {
                 ).containsMatchIn(responseText)
 
                 val report = buildString {
+
                     appendLine("APPLE LOCKDOWN QUERYTYPE TEST")
                     appendLine("Date: ${java.util.Date()}")
                     appendLine("TCP connection: SUCCESS REPORTED")
                     appendLine("QueryType send: SUCCESS REPORTED")
                     appendLine("Response received: YES")
-                    appendLine("Response size: ${responseBytes.size} bytes")
-                    appendLine("Binary plist: $isBinaryPlist")
-                    appendLine("Type field detected: $hasType")
+                    appendLine(
+                        "Response size: ${responseBytes.size} bytes"
+                    )
+
+                    appendLine(
+                        "Binary plist: $isBinaryPlist"
+                    )
+
+                    appendLine(
+                        "Type field detected: $hasType"
+                    )
+
                     appendLine()
                     appendLine("RESPONSE:")
 
                     if (isBinaryPlist) {
+
                         appendLine(
                             "Binary plist received. XML text decoding is not applicable."
                         )
+
                         appendLine(
                             responseBytes.joinToString(" ") {
                                 "%02X".format(it)
                             }
                         )
+
                     } else {
                         appendLine(responseText)
                     }
@@ -779,6 +998,7 @@ class MainActivity : ComponentActivity() {
                     }
 
             } catch (e: Exception) {
+
                 val error =
                     "LOCKDOWN QUERYTYPE TEST ERROR\n" +
                         "${e.javaClass.simpleName}: " +
@@ -786,14 +1006,18 @@ class MainActivity : ComponentActivity() {
 
                 lockdownInfo.value = error
                 diagnosticReport.value += "\n\n$error"
-                status.value = "Lockdown protocol exchange failed."
+
+                status.value =
+                    "Lockdown protocol exchange failed."
 
                 if (connection.isConnected) {
                     lockdownTcp = connection
                 } else {
+
                     withContext(Dispatchers.IO) {
                         connection.close()
                     }
+
                     lockdownTcp = null
                 }
 
@@ -808,6 +1032,7 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun getDeviceInformation() {
+
         val connection = lockdownTcp
 
         if (connection == null || !connection.isConnected) {
@@ -817,15 +1042,21 @@ class MainActivity : ComponentActivity() {
         }
 
         if (lockdownTestRunning) {
-            status.value = "Another Lockdown operation is running."
+            status.value =
+                "Another Lockdown operation is running."
             return
         }
 
         lockdownTestRunning = true
-        deviceInfo.value = "Retrieving iPad information..."
-        status.value = "Sending Lockdown GetValue requests..."
+
+        deviceInfo.value =
+            "Retrieving iPad information..."
+
+        status.value =
+            "Sending Lockdown GetValue requests..."
 
         lifecycleScope.launch {
+
             val requestedKeys = listOf(
                 "DeviceName",
                 "ProductType",
@@ -839,7 +1070,9 @@ class MainActivity : ComponentActivity() {
             val results = linkedMapOf<String, String>()
 
             try {
+
                 for (key in requestedKeys) {
+
                     val request = """
                         <?xml version="1.0" encoding="UTF-8"?>
                         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -856,6 +1089,7 @@ class MainActivity : ComponentActivity() {
                     """.trimIndent()
 
                     val response = withContext(Dispatchers.IO) {
+
                         val sendResult = connection.sendData(
                             data = createLockdownFrame(request),
                             timeoutMs = 7000
@@ -873,24 +1107,39 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
-                    val responseText = response.toString(Charsets.UTF_8)
+                    val responseText =
+                        response.toString(Charsets.UTF_8)
 
                     results[key] = when {
+
                         responseText.startsWith("bplist00") -> {
                             "Binary plist response received; XML parser cannot decode it."
                         }
 
-                        extractPlistValue(responseText, "Error") != null -> {
+                        extractPlistValue(
+                            responseText,
+                            "Error"
+                        ) != null -> {
                             "Unavailable: ${
-                                extractPlistValue(responseText, "Error")
+                                extractPlistValue(
+                                    responseText,
+                                    "Error"
+                                )
                             }"
                         }
 
                         key == "DevicePublicKey" -> {
-                            val publicKey =
-                                extractPlistValue(responseText, "Value")
 
-                            if (publicKey is ByteArray && publicKey.isNotEmpty()) {
+                            val publicKey =
+                                extractPlistValue(
+                                    responseText,
+                                    "Value"
+                                )
+
+                            if (
+                                publicKey is ByteArray &&
+                                publicKey.isNotEmpty()
+                            ) {
                                 inspectDevicePublicKey(publicKey)
                             } else {
                                 "Invalid DevicePublicKey response. Expected binary data."
@@ -902,9 +1151,13 @@ class MainActivity : ComponentActivity() {
                 }
 
                 val report = buildString {
+
                     appendLine("APPLE LOCKDOWN GETVALUE TEST")
                     appendLine("Date: ${java.util.Date()}")
-                    appendLine("Connection: Existing Lockdown TCP session")
+                    appendLine(
+                        "Connection: Existing Lockdown TCP session"
+                    )
+
                     appendLine()
                     appendLine("DEVICE INFORMATION")
                     appendLine()
@@ -923,13 +1176,21 @@ class MainActivity : ComponentActivity() {
                     "Lockdown GetValue requests completed. Check the device information."
 
             } catch (e: Exception) {
+
                 val error = buildString {
+
                     appendLine("LOCKDOWN GETVALUE FAILED")
                     appendLine("Date: ${java.util.Date()}")
                     appendLine()
-                    appendLine("${e.javaClass.simpleName}: ${e.message}")
+
+                    appendLine(
+                        "${e.javaClass.simpleName}: ${e.message}"
+                    )
+
                     appendLine()
-                    appendLine("Values received before failure:")
+                    appendLine(
+                        "Values received before failure:"
+                    )
 
                     results.forEach { (key, value) ->
                         appendLine("$key: $value")
@@ -938,14 +1199,18 @@ class MainActivity : ComponentActivity() {
 
                 deviceInfo.value = error
                 diagnosticReport.value += "\n\n$error"
-                status.value = "GetValue failed. Copy diagnostics for inspection."
+
+                status.value =
+                    "GetValue failed. Copy diagnostics for inspection."
 
                 if (!connection.isConnected) {
+
                     runCatching {
                         withContext(Dispatchers.IO) {
                             connection.close()
                         }
                     }
+
                     lockdownTcp = null
                 }
 
@@ -956,48 +1221,171 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------------------------------------------------------
+    // APPLE LOCKDOWN PAIRING
+    // ---------------------------------------------------------
+
+    private fun pairAppleDevice() {
+
+        val connection = lockdownTcp
+
+        if (connection == null || !connection.isConnected) {
+            status.value =
+                "Connect to Lockdown before pairing."
+            return
+        }
+
+        if (lockdownTestRunning || pairingRunningState.value) {
+            status.value =
+                "Another Lockdown operation is running."
+            return
+        }
+
+        pairingRunningState.value = true
+        lockdownTestRunning = true
+
+        pairingInfo.value =
+            "Preparing Apple pairing request..."
+
+        status.value =
+            "Starting Lockdown pairing..."
+
+        lifecycleScope.launch {
+
+            try {
+
+                // Retrieve the iPad's RSA public key.
+
+                val publicKey =
+                    getDevicePublicKey(connection)
+
+                pairingInfo.value =
+                    "Device public key retrieved. Sending pairing request..."
+
+                // Send the Pair request through the existing
+                // USBMUX2 TCP Lockdown connection.
+
+                val result = pairingManager.pair(
+                    devicePublicKeyPem = publicKey
+                ) { framedRequest ->
+
+                    val sendResult = connection.sendData(
+                        data = framedRequest,
+                        timeoutMs = 10000
+                    )
+
+                    if (!sendResult.success) {
+                        throw IllegalStateException(
+                            "Pair request failed: ${sendResult.message}"
+                        )
+                    }
+
+                    receiveLockdownFrame(
+                        connection = connection,
+                        timeoutMs = 20000
+                    )
+                }
+
+                pairingInfo.value = result.message
+
+                val saved =
+                    pairingManager.hasSavedPairing()
+
+                status.value =
+                    if (result.success && saved) {
+                        "Lockdown pairing response accepted and local identity saved."
+                    } else {
+                        "Pairing not confirmed. Check the pairing response."
+                    }
+
+                val report = buildString {
+
+                    appendLine("APPLE PAIRING RESULT")
+                    appendLine("Date: ${java.util.Date()}")
+                    appendLine()
+
+                    appendLine("Success: ${result.success}")
+                    appendLine("Saved identity: $saved")
+                    appendLine()
+
+                    appendLine("Message:")
+                    appendLine(result.message)
+
+                    appendLine()
+                    appendLine("Lockdown response:")
+                    appendLine(result.response)
+                }
+
+                diagnosticReport.value += "\n\n$report"
+
+            } catch (e: Exception) {
+
+                val error =
+                    "Pairing failed: " +
+                        "${e.message ?: e.javaClass.simpleName}"
+
+                pairingInfo.value = error
+                status.value = "Apple pairing failed."
+
+                diagnosticReport.value +=
+                    "\n\nAPPLE PAIRING ERROR\n$error"
+
+            } finally {
+
+                pairingRunningState.value = false
+                lockdownTestRunning = false
+            }
+        }
+    }
+
+    // ---------------------------------------------------------
     // LOCKDOWN XML PLIST PARSER
     // ---------------------------------------------------------
 
     private fun extractGetValue(xml: String): String {
+
         return try {
-            val error = extractPlistValue(xml, "Error")
+
+            val error =
+                extractPlistValue(xml, "Error")
 
             if (error != null) {
                 return "Unavailable: $error"
             }
 
-            val value = extractPlistValue(xml, "Value")
+            val value =
+                extractPlistValue(xml, "Value")
 
             when (value) {
+
                 null -> "No Value field returned."
 
-                is String -> value.ifBlank { "Empty value" }
+                is String ->
+                    value.ifBlank { "Empty value" }
 
-                is ByteArray -> {
-                    "Binary data returned: ${value.size} bytes. " +
-                        "Base64 decoding successful."
-                }
+                is ByteArray ->
+                    "Binary data returned: ${value.size} bytes."
 
-                is Boolean -> value.toString()
+                is Boolean ->
+                    value.toString()
 
-                is Number -> value.toString()
+                is Number ->
+                    value.toString()
 
-                is Map<*, *> -> {
+                is Map<*, *> ->
                     "Dictionary returned with ${value.size} entries."
-                }
 
-                is List<*> -> {
+                is List<*> ->
                     "Array returned with ${value.size} items."
-                }
 
-                else -> {
+                else ->
                     "Unsupported plist value: ${value.javaClass.simpleName}"
-                }
             }
 
         } catch (e: Exception) {
-            "Plist parsing failed: ${e.message ?: e.javaClass.simpleName}"
+
+            "Plist parsing failed: ${
+                e.message ?: e.javaClass.simpleName
+            }"
         }
     }
 
@@ -1005,6 +1393,7 @@ class MainActivity : ComponentActivity() {
         xml: String,
         requestedKey: String
     ): Any? {
+
         val trimmed = xml.trimStart()
 
         require(
@@ -1023,13 +1412,16 @@ class MainActivity : ComponentActivity() {
         var event = parser.eventType
 
         while (event != XmlPullParser.END_DOCUMENT) {
+
             if (
                 event == XmlPullParser.START_TAG &&
                 parser.name == "key"
             ) {
+
                 val key = parser.nextText()
 
                 if (key == requestedKey) {
+
                     var nextEvent = parser.next()
 
                     while (
@@ -1039,7 +1431,9 @@ class MainActivity : ComponentActivity() {
                         nextEvent = parser.next()
                     }
 
-                    if (nextEvent != XmlPullParser.START_TAG) {
+                    if (
+                        nextEvent != XmlPullParser.START_TAG
+                    ) {
                         return null
                     }
 
@@ -1056,24 +1450,26 @@ class MainActivity : ComponentActivity() {
     private fun parsePlistElement(
         parser: XmlPullParser
     ): Any? {
-        return when (parser.name) {
-            "string" -> parser.nextText()
 
-            "integer" -> {
+        return when (parser.name) {
+
+            "string" ->
+                parser.nextText()
+
+            "integer" ->
                 parser.nextText().trim().toLongOrNull()
                     ?: throw IllegalArgumentException(
                         "Invalid plist integer."
                     )
-            }
 
-            "real" -> {
+            "real" ->
                 parser.nextText().trim().toDoubleOrNull()
                     ?: throw IllegalArgumentException(
                         "Invalid plist real number."
                     )
-            }
 
             "data" -> {
+
                 val encoded = parser.nextText()
                     .filterNot { it.isWhitespace() }
 
@@ -1088,27 +1484,32 @@ class MainActivity : ComponentActivity() {
 
             "false" -> false
 
-            "date" -> parser.nextText()
+            "date" ->
+                parser.nextText()
 
-            "array" -> parsePlistArray(parser)
+            "array" ->
+                parsePlistArray(parser)
 
-            "dict" -> parsePlistDictionary(parser)
+            "dict" ->
+                parsePlistDictionary(parser)
 
-            else -> {
+            else ->
                 throw IllegalArgumentException(
                     "Unsupported plist element: ${parser.name}"
                 )
-            }
         }
     }
 
     private fun parsePlistArray(
         parser: XmlPullParser
     ): List<Any?> {
+
         val values = mutableListOf<Any?>()
 
         while (true) {
+
             when (parser.next()) {
+
                 XmlPullParser.START_TAG -> {
                     values.add(parsePlistElement(parser))
                 }
@@ -1131,11 +1532,15 @@ class MainActivity : ComponentActivity() {
     private fun parsePlistDictionary(
         parser: XmlPullParser
     ): Map<String, Any?> {
+
         val values = linkedMapOf<String, Any?>()
 
         while (true) {
+
             when (parser.next()) {
+
                 XmlPullParser.START_TAG -> {
+
                     if (parser.name != "key") {
                         throw IllegalArgumentException(
                             "Expected plist dictionary key."
@@ -1153,13 +1558,16 @@ class MainActivity : ComponentActivity() {
                         nextEvent = parser.next()
                     }
 
-                    if (nextEvent != XmlPullParser.START_TAG) {
+                    if (
+                        nextEvent != XmlPullParser.START_TAG
+                    ) {
                         throw IllegalArgumentException(
                             "Missing value for plist key: $key"
                         )
                     }
 
-                    values[key] = parsePlistElement(parser)
+                    values[key] =
+                        parsePlistElement(parser)
                 }
 
                 XmlPullParser.END_TAG -> {
@@ -1178,12 +1586,13 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------------------------------------------------------
-    // LOCKDOWN DEVICE PUBLIC KEY RETRIEVAL
+    // DEVICE PUBLIC KEY RETRIEVAL
     // ---------------------------------------------------------
 
     private suspend fun getDevicePublicKey(
         connection: UsbMux2TcpConnection
     ): ByteArray {
+
         val request = """
             <?xml version="1.0" encoding="UTF-8"?>
             <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -1201,6 +1610,7 @@ class MainActivity : ComponentActivity() {
         """.trimIndent()
 
         val response = withContext(Dispatchers.IO) {
+
             val result = connection.sendData(
                 data = createLockdownFrame(request),
                 timeoutMs = 7000
@@ -1222,15 +1632,20 @@ class MainActivity : ComponentActivity() {
 
         if (xml.startsWith("bplist00")) {
             throw IllegalStateException(
-                "DevicePublicKey response is a binary plist. " +
-                    "A binary plist decoder is required."
+                "DevicePublicKey response is a binary plist. A binary plist decoder is required."
             )
         }
 
-        val publicKey = extractPlistValue(xml, "Value")
+        val publicKey =
+            extractPlistValue(xml, "Value")
 
-        if (publicKey !is ByteArray || publicKey.isEmpty()) {
-            val error = extractPlistValue(xml, "Error")
+        if (
+            publicKey !is ByteArray ||
+            publicKey.isEmpty()
+        ) {
+
+            val error =
+                extractPlistValue(xml, "Error")
 
             throw IllegalStateException(
                 "DevicePublicKey was not returned as binary data. " +
@@ -1242,16 +1657,22 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------------------------------------------------------
-    // DEVICE PUBLIC KEY VALIDATION
-    // Supports Apple's PKCS#1 RSA PUBLIC KEY PEM format
+    // RSA PUBLIC KEY VALIDATION
     // ---------------------------------------------------------
 
-    private fun inspectDevicePublicKey(data: ByteArray): String {
+    private fun inspectDevicePublicKey(
+        data: ByteArray
+    ): String {
+
         return try {
+
             val pem = data.toString(Charsets.US_ASCII).trim()
 
-            val header = "-----BEGIN RSA PUBLIC KEY-----"
-            val footer = "-----END RSA PUBLIC KEY-----"
+            val header =
+                "-----BEGIN RSA PUBLIC KEY-----"
+
+            val footer =
+                "-----END RSA PUBLIC KEY-----"
 
             require(pem.startsWith(header)) {
                 "Unexpected PEM header. Expected BEGIN RSA PUBLIC KEY."
@@ -1270,16 +1691,19 @@ class MainActivity : ComponentActivity() {
                 "RSA public key contains no Base64 data."
             }
 
-            val der = Base64.decode(base64Content, Base64.DEFAULT)
+            val der =
+                Base64.decode(base64Content, Base64.DEFAULT)
 
             var offset = 0
 
             fun readLength(): Int {
+
                 require(offset < der.size) {
                     "Unexpected end of DER data."
                 }
 
-                val first = der[offset++].toInt() and 0xFF
+                val first =
+                    der[offset++].toInt() and 0xFF
 
                 if (first < 0x80) {
                     return first
@@ -1287,15 +1711,19 @@ class MainActivity : ComponentActivity() {
 
                 val count = first and 0x7F
 
-                require(count in 1..4 && offset + count <= der.size) {
+                require(
+                    count in 1..4 &&
+                        offset + count <= der.size
+                ) {
                     "Invalid DER length."
                 }
 
                 var length = 0L
 
                 repeat(count) {
-                    length = (length shl 8) or
-                        (der[offset++].toLong() and 0xFFL)
+                    length =
+                        (length shl 8) or
+                            (der[offset++].toLong() and 0xFFL)
                 }
 
                 require(length <= Int.MAX_VALUE) {
@@ -1306,6 +1734,7 @@ class MainActivity : ComponentActivity() {
             }
 
             fun readInteger(): BigInteger {
+
                 require(
                     offset < der.size &&
                         (der[offset++].toInt() and 0xFF) == 0x02
@@ -1324,18 +1753,16 @@ class MainActivity : ComponentActivity() {
 
                 val value = BigInteger(
                     1,
-                    der.copyOfRange(offset, offset + length)
+                    der.copyOfRange(
+                        offset,
+                        offset + length
+                    )
                 )
 
                 offset += length
+
                 return value
             }
-
-            // PKCS#1 RSAPublicKey:
-            // SEQUENCE {
-            //     INTEGER modulus
-            //     INTEGER publicExponent
-            // }
 
             require(
                 offset < der.size &&
@@ -1378,42 +1805,62 @@ class MainActivity : ComponentActivity() {
                 }
 
             buildString {
+
                 appendLine("PUBLIC KEY VALIDATION")
                 appendLine()
-                appendLine("Received PEM bytes: ${data.size}")
-                appendLine("Decoded DER bytes: ${der.size}")
+
+                appendLine(
+                    "Received PEM bytes: ${data.size}"
+                )
+
+                appendLine(
+                    "Decoded DER bytes: ${der.size}"
+                )
+
                 appendLine("PEM format: RSA PUBLIC KEY")
                 appendLine("DER format: PKCS#1")
                 appendLine("Algorithm: ${publicKey.algorithm}")
                 appendLine("Format: ${publicKey.format}")
+
                 appendLine(
                     "RSA key size: ${publicKey.modulus.bitLength()} bits"
                 )
-                appendLine("Public exponent: ${publicKey.publicExponent}")
+
+                appendLine(
+                    "Public exponent: ${publicKey.publicExponent}"
+                )
+
                 appendLine()
                 appendLine("SHA-256 fingerprint:")
                 appendLine(fingerprint)
+
                 appendLine()
                 appendLine("Key validation: SUCCESS")
-                appendLine("RSA public key successfully parsed.")
-                appendLine()
+
                 appendLine(
                     "This validates key encoding, not device identity."
                 )
             }.trim()
 
         } catch (e: Exception) {
+
             val prefix = data.take(24).joinToString(" ") {
                 "%02X".format(it)
             }
 
             buildString {
+
                 appendLine("PUBLIC KEY VALIDATION FAILED")
                 appendLine("Received bytes: ${data.size}")
-                appendLine("Expected encoding: PKCS#1 RSA PUBLIC KEY")
+
+                appendLine(
+                    "Expected encoding: PKCS#1 RSA PUBLIC KEY"
+                )
+
                 appendLine()
                 appendLine("First 24 bytes:")
                 appendLine(prefix)
+
                 appendLine()
                 appendLine(
                     "Error: ${e.message ?: e.javaClass.simpleName}"
@@ -1426,7 +1873,10 @@ class MainActivity : ComponentActivity() {
     // LOCKDOWN MESSAGE FRAMING
     // ---------------------------------------------------------
 
-    private fun createLockdownFrame(xml: String): ByteArray {
+    private fun createLockdownFrame(
+        xml: String
+    ): ByteArray {
+
         val payload = xml.toByteArray(Charsets.UTF_8)
 
         require(payload.size in 1..1_048_576) {
@@ -1441,7 +1891,13 @@ class MainActivity : ComponentActivity() {
         frame[2] = (length ushr 8).toByte()
         frame[3] = length.toByte()
 
-        System.arraycopy(payload, 0, frame, 4, payload.size)
+        System.arraycopy(
+            payload,
+            0,
+            frame,
+            4,
+            payload.size
+        )
 
         return frame
     }
@@ -1454,13 +1910,18 @@ class MainActivity : ComponentActivity() {
         connection: UsbMux2TcpConnection,
         timeoutMs: Int = 10000
     ): ByteArray {
+
         val deadline =
             SystemClock.elapsedRealtime() + timeoutMs
 
         val received = ByteArrayOutputStream()
+
         var expectedLength = -1
 
-        while (SystemClock.elapsedRealtime() < deadline) {
+        while (
+            SystemClock.elapsedRealtime() < deadline
+        ) {
+
             val result = connection.receiveData(
                 maxBytes = 4096,
                 timeoutMs = 1000
@@ -1471,6 +1932,7 @@ class MainActivity : ComponentActivity() {
             }
 
             if (result.data.isEmpty()) {
+
                 if (connection.isRemoteClosed) {
                     throw IllegalStateException(
                         "The iPad closed the Lockdown connection before replying."
@@ -1490,7 +1952,11 @@ class MainActivity : ComponentActivity() {
 
             val bytes = received.toByteArray()
 
-            if (bytes.size >= 4 && expectedLength == -1) {
+            if (
+                bytes.size >= 4 &&
+                expectedLength == -1
+            ) {
+
                 val parsedLength =
                     ((bytes[0].toLong() and 0xFFL) shl 24) or
                         ((bytes[1].toLong() and 0xFFL) shl 16) or
@@ -1510,6 +1976,7 @@ class MainActivity : ComponentActivity() {
                 expectedLength > 0 &&
                 bytes.size >= 4 + expectedLength
             ) {
+
                 return bytes.copyOfRange(
                     4,
                     4 + expectedLength
@@ -1528,21 +1995,43 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun closeTransport() {
-        runCatching { lockdownTcp?.close() }
+
+        runCatching {
+            lockdownTcp?.close()
+        }
 
         lockdownTcp = null
+
         usbmux2Ready = false
         usbmuxTestRunning = false
         lockdownTestRunning = false
 
-        runCatching { transport?.close() }
+        pairingRunningState.value = false
+
+        runCatching {
+            transport?.close()
+        }
+
         transport = null
 
-        transportInfo.value = "USB transport is closed"
-        usbmuxInfo.value = "USBMUX handshake has not been tested."
+        transportInfo.value =
+            "USB transport is closed"
+
+        usbmuxInfo.value =
+            "USBMUX handshake has not been tested."
+
         lockdownInfo.value =
             "Lockdown protocol exchange has not been tested."
-        deviceInfo.value = "No device information retrieved yet."
+
+        deviceInfo.value =
+            "No device information retrieved yet."
+
+        pairingInfo.value =
+            if (pairingManager.hasSavedPairing()) {
+                "Saved pairing identity exists. Reconnect to verify the device pairing."
+            } else {
+                "Apple device has not been paired."
+            }
     }
 
     // ---------------------------------------------------------
@@ -1550,11 +2039,16 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     private fun inspectIpa(uri: Uri) {
-        operationStatus.value = "Copying and inspecting IPA..."
+
+        operationStatus.value =
+            "Copying and inspecting IPA..."
 
         lifecycleScope.launch {
+
             try {
+
                 val result = withContext(Dispatchers.IO) {
+
                     IpaInspector.inspect(
                         contentResolver,
                         uri,
@@ -1566,24 +2060,31 @@ class MainActivity : ComponentActivity() {
                 stagedIpa = result
 
                 ipaInfo.value = buildString {
+
                     appendLine(
                         "File size: ${result.sizeBytes / (1024 * 1024)} MiB"
                     )
+
                     appendLine(
                         "App bundle: ${result.appBundlePath ?: "Unknown"}"
                     )
+
                     appendLine(
                         "Display name: ${result.bundleName ?: "Not parsed"}"
                     )
+
                     appendLine(
                         "Bundle ID: ${result.bundleIdentifier ?: "Not parsed"}"
                     )
+
                     appendLine(
                         "Version: ${result.version ?: "Not parsed"}"
                     )
+
                     appendLine(
                         "Minimum iOS: ${result.minimumOsVersion ?: "Not parsed"}"
                     )
+
                     appendLine(
                         "Info.plist format: ${result.plistFormat}"
                     )
@@ -1597,8 +2098,11 @@ class MainActivity : ComponentActivity() {
                     "IPA archive validated. Signing and installation are not available yet."
 
             } catch (t: Exception) {
+
                 operationStatus.value =
-                    "IPA inspection failed: ${t.message ?: t.javaClass.simpleName}"
+                    "IPA inspection failed: ${
+                        t.message ?: t.javaClass.simpleName
+                    }"
 
                 ipaInfo.value = "No valid IPA loaded"
             }
@@ -1610,12 +2114,14 @@ class MainActivity : ComponentActivity() {
     // ---------------------------------------------------------
 
     override fun onDestroy() {
+
         closeTransport()
 
         stagedIpa?.stagedFile?.delete()
         stagedIpa = null
 
         if (receiverRegistered) {
+
             runCatching {
                 unregisterReceiver(usbReceiver)
             }
@@ -1645,25 +2151,33 @@ private fun Dashboard(
     deviceInfo: String,
     ipaInfo: String,
     operationStatus: String,
+    pairingInfo: String,
+    pairingRunning: Boolean,
     hasDiagnosticReport: Boolean,
+
     onScan: () -> Unit,
     onRequestPermission: (UsbDevice) -> Unit,
     onProbe: () -> Unit,
     onUsbMuxHandshake: () -> Unit,
     onConnectLockdown: () -> Unit,
     onGetDeviceInformation: () -> Unit,
+    onPairAppleDevice: () -> Unit,
     onCloseTransport: () -> Unit,
     onCopyDiagnostics: () -> Unit,
     onCopyIpa: () -> Unit,
     onChooseIpa: () -> Unit
 ) {
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .verticalScroll(rememberScrollState())
             .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
+
+        verticalArrangement =
+            Arrangement.spacedBy(14.dp)
     ) {
+
         Text(
             "IMPACTOR ANDROID",
             style = MaterialTheme.typography.headlineSmall
@@ -1674,12 +2188,19 @@ private fun Dashboard(
             style = MaterialTheme.typography.bodyMedium
         )
 
+        // -----------------------------------------------------
+        // USB CONNECTION
+        // -----------------------------------------------------
+
         SectionCard("USB CONNECTION") {
+
             Text(status)
 
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement =
+                    Arrangement.spacedBy(8.dp)
             ) {
+
                 Button(onClick = onScan) {
                     Text("Scan USB")
                 }
@@ -1741,27 +2262,71 @@ private fun Dashboard(
                 deviceInfo,
                 style = MaterialTheme.typography.bodySmall
             )
+
+            // ---------------------------------------------
+            // APPLE PAIRING
+            // ---------------------------------------------
+
+            Text(
+                "APPLE DEVICE PAIRING",
+                style = MaterialTheme.typography.titleMedium
+            )
+
+            Button(
+                onClick = onPairAppleDevice,
+                enabled = !pairingRunning,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    if (pairingRunning) {
+                        "Pairing..."
+                    } else {
+                        "Pair Apple Device"
+                    }
+                )
+            }
+
+            Text(
+                pairingInfo,
+                style = MaterialTheme.typography.bodySmall
+            )
+
+            Text(
+                "Unlock your iPad and accept the Trust This Computer prompt if it appears.",
+                style = MaterialTheme.typography.bodySmall
+            )
         }
 
+        // -----------------------------------------------------
+        // APPLE DEVICES
+        // -----------------------------------------------------
+
         SectionCard("APPLE DEVICES") {
+
             if (devices.isEmpty()) {
-                Text("Connect an iPhone or iPad using USB OTG.")
+                Text(
+                    "Connect an iPhone or iPad using USB OTG."
+                )
             }
 
             devices.forEach { device ->
+
                 Card(
                     colors = CardDefaults.cardColors(
                         containerColor =
                             MaterialTheme.colorScheme.surfaceVariant
                     )
                 ) {
+
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
                             .padding(12.dp),
+
                         verticalArrangement =
                             Arrangement.spacedBy(5.dp)
                     ) {
+
                         Text(
                             device.productName ?: "Apple USB device",
                             style = MaterialTheme.typography.titleMedium
@@ -1775,7 +2340,9 @@ private fun Dashboard(
                             )
                         )
 
-                        Text("Interfaces: ${device.interfaceCount}")
+                        Text(
+                            "Interfaces: ${device.interfaceCount}"
+                        )
 
                         Button(
                             onClick = {
@@ -1789,12 +2356,17 @@ private fun Dashboard(
             }
 
             Text(
-                "Connected does not mean paired. Lockdown pairing is not implemented yet.",
+                "USB detection and permission do not establish an Apple pairing relationship.",
                 style = MaterialTheme.typography.bodySmall
             )
         }
 
+        // -----------------------------------------------------
+        // IPA INSPECTOR
+        // -----------------------------------------------------
+
         SectionCard("IPA INSPECTOR") {
+
             Button(onClick = onChooseIpa) {
                 Text("Choose IPA file")
             }
@@ -1806,8 +2378,11 @@ private fun Dashboard(
 
             OutlinedButton(
                 onClick = onCopyIpa,
-                enabled = ipaInfo != "No IPA selected" &&
-                    ipaInfo != "No valid IPA loaded",
+
+                enabled =
+                    ipaInfo != "No IPA selected" &&
+                        ipaInfo != "No valid IPA loaded",
+
                 modifier = Modifier.fillMaxWidth()
             ) {
                 Text("Copy IPA Information")
@@ -1819,7 +2394,12 @@ private fun Dashboard(
             )
         }
 
+        // -----------------------------------------------------
+        // FEATURE STATUS
+        // -----------------------------------------------------
+
         SectionCard("FEATURE STATUS") {
+
             StatusLine("Android USB enumeration", true)
             StatusLine("Android USB permission", true)
             StatusLine("USB bulk endpoint diagnostics", true)
@@ -1832,7 +2412,12 @@ private fun Dashboard(
             StatusLine("XML plist data parsing", true)
             StatusLine("Nested XML plist parsing", true)
             StatusLine("RSA public key validation", true)
-            StatusLine("Lockdown pairing", false)
+
+            StatusLine(
+                "Lockdown pairing",
+                false
+            )
+
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
             StatusLine("Apple ID / Anisette authentication", false)
@@ -1842,7 +2427,7 @@ private fun Dashboard(
         }
 
         Text(
-            "This development build can test USBMUX, basic Lockdown requests, and RSA public-key parsing. Pairing, signing, and IPA installation are not implemented.",
+            "This development build supports USBMUX2, basic Lockdown requests, and RSA public-key parsing. Pairing still requires device-side verification. Signing and IPA installation are not implemented.",
             style = MaterialTheme.typography.bodySmall
         )
     }
@@ -1857,11 +2442,18 @@ private fun SectionCard(
     title: String,
     content: @androidx.compose.runtime.Composable () -> Unit
 ) {
-    Card(modifier = Modifier.fillMaxWidth()) {
+
+    Card(
+        modifier = Modifier.fillMaxWidth()
+    ) {
+
         Column(
             modifier = Modifier.padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(9.dp)
+
+            verticalArrangement =
+                Arrangement.spacedBy(9.dp)
         ) {
+
             Text(
                 title,
                 style = MaterialTheme.typography.titleMedium
@@ -1877,22 +2469,32 @@ private fun StatusLine(
     label: String,
     implemented: Boolean
 ) {
+
     Row(
         modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween
+
+        horizontalArrangement =
+            Arrangement.SpaceBetween
     ) {
+
         Text(
             label,
             style = MaterialTheme.typography.bodyMedium
         )
 
         Text(
-            if (implemented) "Implemented" else "Pending",
-            color = if (implemented) {
-                MaterialTheme.colorScheme.primary
+            if (implemented) {
+                "Implemented"
             } else {
-                MaterialTheme.colorScheme.error
-            }
+                "Pending"
+            },
+
+            color =
+                if (implemented) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.error
+                }
         )
     }
 }
