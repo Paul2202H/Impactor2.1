@@ -189,17 +189,15 @@ class UsbMux2TcpConnection(
                     )
                 }
 
-                // Our SYN has been acknowledged.
                 tcpTxSequence = expectedAck
                 tcpTxAcknowledged = expectedAck
 
-                // The remote SYN consumes one sequence number.
                 tcpRxAcknowledgement =
                     addSequence(tcp.sequence, 1)
 
                 peerWindow = tcp.window
 
-                // Send the final ACK.
+                // Final handshake ACK.
                 sendTcpPacket(
                     flags = TCP_ACK,
                     sequence = tcpTxSequence,
@@ -324,8 +322,21 @@ class UsbMux2TcpConnection(
                     chunk.size.toLong()
                 )
 
+                /*
+                 * IMPORTANT:
+                 *
+                 * Apple's USBMUX TCP handler reported:
+                 *
+                 * th._flags = 0x18, not TH_ACK(0x10)
+                 *
+                 * 0x18 = PSH | ACK
+                 * 0x10 = ACK only
+                 *
+                 * Therefore, send application payload using
+                 * ACK-only flags for this protocol test.
+                 */
                 sendTcpPacket(
-                    flags = TCP_ACK or TCP_PSH,
+                    flags = TCP_ACK,
                     sequence = tcpTxSequence,
                     acknowledgement = tcpRxAcknowledgement,
                     payload = chunk
@@ -573,13 +584,9 @@ class UsbMux2TcpConnection(
         val dataOffsetByte =
             packet[offset + 12].toInt() and 0xFF
 
-        // Only the upper nibble determines the TCP header length.
         val headerSize =
             ((dataOffsetByte ushr 4) and 0x0F) * 4
 
-        // The lower nibble is preserved for diagnostics.
-        // Do not reject 0x5F: this value was observed in the
-        // iPad's SYN-ACK response.
         val headerControlBits = dataOffsetByte and 0x0F
 
         val flags = packet[offset + 13].toInt() and 0xFF
@@ -641,13 +648,11 @@ class UsbMux2TcpConnection(
         putUInt32BE(tcp, 4, sequence)
         putUInt32BE(tcp, 8, acknowledgement)
 
-        // Five 32-bit words = 20-byte TCP header.
         tcp[12] = 0x50.toByte()
         tcp[13] = flags.toByte()
 
         putUInt16BE(tcp, 14, TCP_WINDOW)
 
-        // USBMUX2 pseudo-TCP does not use normal IP TCP checksums.
         putUInt16BE(tcp, 16, 0)
         putUInt16BE(tcp, 18, 0)
 
@@ -790,8 +795,6 @@ class UsbMux2TcpConnection(
             "Invalid incoming USBMUX2 magic: 0x${magic.toString(16)}."
         }
 
-        // The next outgoing packet echoes the latest received
-        // device sequence value.
         muxRxSequence = readUInt16BE(packet, 14)
     }
 
