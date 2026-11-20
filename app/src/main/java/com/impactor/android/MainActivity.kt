@@ -42,6 +42,7 @@ import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
 
 class MainActivity : ComponentActivity() {
 
@@ -62,7 +63,7 @@ class MainActivity : ComponentActivity() {
     )
 
     private val lockdownInfo = mutableStateOf(
-        "Lockdown TCP connection has not been tested."
+        "Lockdown protocol exchange has not been tested."
     )
 
     private val ipaInfo = mutableStateOf("No IPA selected")
@@ -689,7 +690,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------------------------------------------------------
-    // LOCKDOWN TCP CONNECTION TEST
+    // LOCKDOWN TCP + QUERYTYPE TEST
     // ---------------------------------------------------------
 
     private fun connectLockdown() {
@@ -708,23 +709,23 @@ class MainActivity : ComponentActivity() {
         }
 
         if (lockdownTestRunning) {
-            status.value = "TCP connection test is already running."
+            status.value = "Lockdown test is already running."
             return
         }
 
         if (lockdownTcp?.isConnected == true) {
             status.value =
-                "The experimental TCP connection is already established."
+                "A Lockdown TCP connection is already open. Close it before retrying."
             return
         }
 
         lockdownTestRunning = true
 
         lockdownInfo.value =
-            "Attempting experimental USBMUX2 TCP connection to port 62078..."
+            "Connecting to Lockdown port 62078..."
 
         status.value =
-            "Testing USBMUX2 pseudo-TCP connection..."
+            "Testing Lockdown TCP and QueryType exchange..."
 
         lifecycleScope.launch {
 
@@ -735,71 +736,280 @@ class MainActivity : ComponentActivity() {
 
             try {
 
-                val result = withContext(Dispatchers.IO) {
+                // Step 1: Establish the USBMUX2 pseudo-TCP connection.
+                val connectResult = withContext(Dispatchers.IO) {
                     connection.connect(timeoutMs = 7000)
                 }
 
+                if (!connectResult.success) {
+
+                    val report = buildString {
+                        appendLine("LOCKDOWN TCP CONNECTION FAILED")
+                        appendLine("Date: ${java.util.Date()}")
+                        appendLine(connectResult.message)
+                        appendLine("Local port: ${connectResult.localPort}")
+                        appendLine("Remote port: ${connectResult.remotePort}")
+                        appendLine()
+                        appendLine("Raw response:")
+                        appendLine(
+                            connectResult.rawResponse.ifBlank {
+                                "No response data"
+                            }
+                        )
+                    }
+
+                    lockdownInfo.value = report
+                    diagnosticReport.value += "\n\n$report"
+
+                    withContext(Dispatchers.IO) {
+                        connection.close()
+                    }
+
+                    status.value = "Lockdown TCP connection failed."
+                    return@launch
+                }
+
+                lockdownTcp = connection
+
+                // Step 2: Build the Lockdown QueryType plist.
+                val queryTypePlist = """
+                    <?xml version="1.0" encoding="UTF-8"?>
+                    <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+                    <plist version="1.0">
+                    <dict>
+                        <key>Label</key>
+                        <string>Impactor Android</string>
+                        <key>Request</key>
+                        <string>QueryType</string>
+                    </dict>
+                    </plist>
+                """.trimIndent()
+
+                val requestFrame =
+                    createLockdownFrame(queryTypePlist)
+
+                lockdownInfo.value =
+                    "TCP handshake reported success. Sending Lockdown QueryType..."
+
+                // Step 3: Send the length-prefixed plist.
+                val sendResult = withContext(Dispatchers.IO) {
+                    connection.sendData(
+                        data = requestFrame,
+                        timeoutMs = 7000
+                    )
+                }
+
+                if (!sendResult.success) {
+
+                    val report =
+                        "TCP handshake reported success, but QueryType send failed.\n" +
+                            sendResult.message
+
+                    lockdownInfo.value = report
+                    diagnosticReport.value += "\n\n$report"
+
+                    status.value = "Lockdown request transmission failed."
+                    return@launch
+                }
+
+                // Step 4: Receive the framed Lockdown response.
+                val responseBytes = withContext(Dispatchers.IO) {
+                    receiveLockdownFrame(
+                        connection = connection,
+                        timeoutMs = 10000
+                    )
+                }
+
+                val responseText =
+                    responseBytes.toString(Charsets.UTF_8)
+
+                val isBinaryPlist =
+                    responseBytes.size >= 8 &&
+                        responseBytes.copyOfRange(0, 8)
+                            .contentEquals("bplist00".toByteArray())
+
+                val hasType = Regex(
+                    """<key>\s*Type\s*</key>\s*<string>[^<]+</string>""",
+                    RegexOption.IGNORE_CASE
+                ).containsMatchIn(responseText)
+
                 val report = buildString {
 
-                    appendLine("APPLE LOCKDOWN TCP TEST")
+                    appendLine("APPLE LOCKDOWN QUERYTYPE TEST")
                     appendLine("Date: ${java.util.Date()}")
-                    appendLine("Result: ${result.message}")
-                    appendLine("Success: ${result.success}")
-                    appendLine("Local port: ${result.localPort}")
-                    appendLine("Remote port: ${result.remotePort}")
-
+                    appendLine("TCP connection: SUCCESS REPORTED")
+                    appendLine("QueryType send: SUCCESS REPORTED")
+                    appendLine("Response received: YES")
+                    appendLine("Response size: ${responseBytes.size} bytes")
+                    appendLine("Binary plist: $isBinaryPlist")
+                    appendLine("Type field detected: $hasType")
                     appendLine()
-                    appendLine("RAW RESPONSE:")
+                    appendLine("RESPONSE:")
 
-                    appendLine(
-                        result.rawResponse.ifBlank {
-                            "No TCP response data."
-                        }
-                    )
-
-                    appendLine()
-                    appendLine(
-                        "Lockdown protocol exchange: NOT IMPLEMENTED"
-                    )
-
-                    appendLine(
-                        "Pairing: NOT IMPLEMENTED"
-                    )
+                    if (isBinaryPlist) {
+                        appendLine(
+                            "Binary plist received. XML text decoding is not applicable."
+                        )
+                        appendLine(
+                            responseBytes.joinToString(" ") {
+                                "%02X".format(it)
+                            }
+                        )
+                    } else {
+                        appendLine(responseText)
+                    }
                 }
 
                 lockdownInfo.value = report
+                diagnosticReport.value += "\n\n$report"
 
-                if (result.success) {
-                    lockdownTcp = connection
-                    status.value =
-                        "Experimental USBMUX2 TCP handshake reported success."
-                } else {
-                    connection.close()
-                    status.value =
-                        "Experimental TCP connection failed."
-                }
-
-                diagnosticReport.value +=
-                    "\n\n$report"
+                status.value =
+                    if (hasType) {
+                        "Lockdown QueryType response received. Pairing is still required for protected operations."
+                    } else if (isBinaryPlist) {
+                        "Lockdown returned a binary plist. Decode it before confirming QueryType."
+                    } else {
+                        "Lockdown response received. Inspect the response before proceeding."
+                    }
 
             } catch (e: Exception) {
 
-                connection.close()
-
                 val error =
-                    "LOCKDOWN TCP TEST ERROR\n" +
-                        "${e.javaClass.simpleName}: ${e.message}"
+                    "LOCKDOWN QUERYTYPE TEST ERROR\n" +
+                        "${e.javaClass.simpleName}: " +
+                        (e.message ?: "Unknown error")
 
                 lockdownInfo.value = error
                 diagnosticReport.value += "\n\n$error"
 
                 status.value =
-                    "Experimental TCP connection failed."
+                    "Lockdown protocol exchange failed."
+
+                if (connection.isConnected) {
+                    lockdownTcp = connection
+                } else {
+                    withContext(Dispatchers.IO) {
+                        connection.close()
+                    }
+                    lockdownTcp = null
+                }
 
             } finally {
                 lockdownTestRunning = false
             }
         }
+    }
+
+    // ---------------------------------------------------------
+    // LOCKDOWN MESSAGE FRAMING
+    // ---------------------------------------------------------
+
+    private fun createLockdownFrame(xml: String): ByteArray {
+
+        val payload = xml.toByteArray(Charsets.UTF_8)
+
+        require(payload.size in 1..1_048_576) {
+            "Invalid Lockdown request size."
+        }
+
+        val length = payload.size
+        val frame = ByteArray(4 + length)
+
+        frame[0] = (length ushr 24).toByte()
+        frame[1] = (length ushr 16).toByte()
+        frame[2] = (length ushr 8).toByte()
+        frame[3] = length.toByte()
+
+        System.arraycopy(
+            payload,
+            0,
+            frame,
+            4,
+            payload.size
+        )
+
+        return frame
+    }
+
+    // ---------------------------------------------------------
+    // LOCKDOWN RESPONSE READER
+    // ---------------------------------------------------------
+
+    private fun receiveLockdownFrame(
+        connection: UsbMux2TcpConnection,
+        timeoutMs: Int = 10000
+    ): ByteArray {
+
+        val deadline =
+            android.os.SystemClock.elapsedRealtime() + timeoutMs
+
+        val received = ByteArrayOutputStream()
+        var expectedLength = -1
+
+        while (
+            android.os.SystemClock.elapsedRealtime() < deadline
+        ) {
+
+            val result = connection.receiveData(
+                maxBytes = 4096,
+                timeoutMs = 1000
+            )
+
+            if (!result.success) {
+                throw IllegalStateException(result.message)
+            }
+
+            if (result.data.isEmpty()) {
+
+                if (connection.isRemoteClosed) {
+                    throw IllegalStateException(
+                        "The iPad closed the Lockdown connection before replying."
+                    )
+                }
+
+                continue
+            }
+
+            received.write(result.data)
+
+            if (received.size() > 1_048_580) {
+                throw IllegalStateException(
+                    "Lockdown response is too large."
+                )
+            }
+
+            val bytes = received.toByteArray()
+
+            if (bytes.size >= 4 && expectedLength == -1) {
+
+                expectedLength =
+                    ((bytes[0].toLong() and 0xFF) shl 24) or
+                    ((bytes[1].toLong() and 0xFF) shl 16) or
+                    ((bytes[2].toLong() and 0xFF) shl 8) or
+                    (bytes[3].toLong() and 0xFF)
+
+                if (expectedLength !in 1..1_048_576) {
+                    throw IllegalStateException(
+                        "Invalid Lockdown response length: $expectedLength"
+                    )
+                }
+            }
+
+            if (
+                expectedLength > 0 &&
+                bytes.size >= 4 + expectedLength
+            ) {
+                return bytes.copyOfRange(
+                    4,
+                    4 + expectedLength
+                )
+            }
+        }
+
+        throw IllegalStateException(
+            "Timed out waiting for a complete Lockdown response. " +
+                "Received ${received.size()} bytes."
+        )
     }
 
     // ---------------------------------------------------------
@@ -824,11 +1034,12 @@ class MainActivity : ComponentActivity() {
         transport = null
 
         transportInfo.value = "USB transport is closed"
+
         usbmuxInfo.value =
             "USBMUX handshake has not been tested."
 
         lockdownInfo.value =
-            "Lockdown TCP connection has not been tested."
+            "Lockdown protocol exchange has not been tested."
     }
 
     // ---------------------------------------------------------
@@ -1025,7 +1236,7 @@ private fun Dashboard(
                 onClick = onConnectLockdown,
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text("Test Lockdown TCP Connection")
+                Text("Test Lockdown QueryType")
             }
 
             Text(
@@ -1122,8 +1333,8 @@ private fun Dashboard(
             StatusLine("Apple usbmux interface selection", true)
             StatusLine("USBMUX version negotiation", true)
             StatusLine("USBMUX2 setup packet transmission", true)
-            StatusLine("USBMUX2 TCP connection", false)
-            StatusLine("Lockdown protocol exchange", false)
+            StatusLine("USBMUX2 TCP handshake test", false)
+            StatusLine("Lockdown QueryType exchange", false)
             StatusLine("Lockdown pairing", false)
             StatusLine("IPA ZIP inspection", true)
             StatusLine("Binary plist metadata parsing", false)
