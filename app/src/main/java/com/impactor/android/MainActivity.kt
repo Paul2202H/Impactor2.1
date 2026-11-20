@@ -47,10 +47,11 @@ import kotlinx.coroutines.withContext
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.ByteArrayOutputStream
+import java.math.BigInteger
 import java.security.KeyFactory
 import java.security.MessageDigest
 import java.security.interfaces.RSAPublicKey
-import java.security.spec.X509EncodedKeySpec
+import java.security.spec.RSAPublicKeySpec
 
 class MainActivity : ComponentActivity() {
 
@@ -1242,57 +1243,164 @@ class MainActivity : ComponentActivity() {
 
     // ---------------------------------------------------------
     // DEVICE PUBLIC KEY VALIDATION
+    // Supports Apple's PKCS#1 RSA PUBLIC KEY PEM format
     // ---------------------------------------------------------
 
     private fun inspectDevicePublicKey(data: ByteArray): String {
         return try {
-            val report = StringBuilder()
+            val pem = data.toString(Charsets.US_ASCII).trim()
 
-            report.appendLine("PUBLIC KEY VALIDATION")
-            report.appendLine("Received bytes: ${data.size}")
-            report.appendLine()
+            val header = "-----BEGIN RSA PUBLIC KEY-----"
+            val footer = "-----END RSA PUBLIC KEY-----"
 
-            val keyFactory = KeyFactory.getInstance("RSA")
-
-            val publicKey = keyFactory.generatePublic(
-                X509EncodedKeySpec(data)
-            )
-
-            if (publicKey !is RSAPublicKey) {
-                return "Public key parsed, but it is not an RSA public key."
+            require(pem.startsWith(header)) {
+                "Unexpected PEM header. Expected BEGIN RSA PUBLIC KEY."
             }
 
-            val modulus = publicKey.modulus
-            val exponent = publicKey.publicExponent
-
-            report.appendLine("Encoding: X.509 SubjectPublicKeyInfo")
-            report.appendLine("Algorithm: ${publicKey.algorithm}")
-            report.appendLine("Format: ${publicKey.format}")
-            report.appendLine("RSA key size: ${modulus.bitLength()} bits")
-            report.appendLine("Public exponent: $exponent")
-            report.appendLine()
-
-            val digest = MessageDigest.getInstance("SHA-256")
-                .digest(data)
-
-            val fingerprint = digest.joinToString(":") {
-                "%02X".format(it)
+            require(pem.endsWith(footer)) {
+                "RSA public key PEM footer is missing."
             }
 
-            report.appendLine("SHA-256 fingerprint:")
-            report.appendLine(fingerprint)
-            report.appendLine()
+            val base64Content = pem
+                .substringAfter(header)
+                .substringBefore(footer)
+                .filterNot { it.isWhitespace() }
 
-            report.appendLine("Key validation: SUCCESS")
-            report.appendLine(
-                "Key can be parsed by Android RSA KeyFactory."
-            )
-            report.appendLine()
-            report.appendLine(
-                "This validates the key encoding, not the device's identity."
-            )
+            require(base64Content.isNotEmpty()) {
+                "RSA public key contains no Base64 data."
+            }
 
-            report.toString().trim()
+            val der = Base64.decode(base64Content, Base64.DEFAULT)
+
+            var offset = 0
+
+            fun readLength(): Int {
+                require(offset < der.size) {
+                    "Unexpected end of DER data."
+                }
+
+                val first = der[offset++].toInt() and 0xFF
+
+                if (first < 0x80) {
+                    return first
+                }
+
+                val count = first and 0x7F
+
+                require(count in 1..4 && offset + count <= der.size) {
+                    "Invalid DER length."
+                }
+
+                var length = 0L
+
+                repeat(count) {
+                    length = (length shl 8) or
+                        (der[offset++].toLong() and 0xFFL)
+                }
+
+                require(length <= Int.MAX_VALUE) {
+                    "DER element is too large."
+                }
+
+                return length.toInt()
+            }
+
+            fun readInteger(): BigInteger {
+                require(
+                    offset < der.size &&
+                        (der[offset++].toInt() and 0xFF) == 0x02
+                ) {
+                    "Expected DER INTEGER."
+                }
+
+                val length = readLength()
+
+                require(
+                    length > 0 &&
+                        length <= der.size - offset
+                ) {
+                    "Invalid RSA integer length."
+                }
+
+                val value = BigInteger(
+                    1,
+                    der.copyOfRange(offset, offset + length)
+                )
+
+                offset += length
+                return value
+            }
+
+            // PKCS#1 RSAPublicKey:
+            // SEQUENCE {
+            //     INTEGER modulus
+            //     INTEGER publicExponent
+            // }
+
+            require(
+                offset < der.size &&
+                    (der[offset++].toInt() and 0xFF) == 0x30
+            ) {
+                "Expected DER SEQUENCE."
+            }
+
+            val sequenceLength = readLength()
+
+            require(sequenceLength == der.size - offset) {
+                "Invalid DER sequence length."
+            }
+
+            val modulus = readInteger()
+            val exponent = readInteger()
+
+            require(offset == der.size) {
+                "Unexpected trailing DER data."
+            }
+
+            require(modulus.signum() > 0) {
+                "Invalid RSA modulus."
+            }
+
+            require(exponent.signum() > 0) {
+                "Invalid RSA public exponent."
+            }
+
+            val publicKey = KeyFactory.getInstance("RSA")
+                .generatePublic(
+                    RSAPublicKeySpec(modulus, exponent)
+                ) as RSAPublicKey
+
+            val fingerprint = MessageDigest
+                .getInstance("SHA-256")
+                .digest(der)
+                .joinToString(":") {
+                    "%02X".format(it)
+                }
+
+            buildString {
+                appendLine("PUBLIC KEY VALIDATION")
+                appendLine()
+                appendLine("Received PEM bytes: ${data.size}")
+                appendLine("Decoded DER bytes: ${der.size}")
+                appendLine("PEM format: RSA PUBLIC KEY")
+                appendLine("DER format: PKCS#1")
+                appendLine("Algorithm: ${publicKey.algorithm}")
+                appendLine("Format: ${publicKey.format}")
+                appendLine(
+                    "RSA key size: ${publicKey.modulus.bitLength()} bits"
+                )
+                appendLine("Public exponent: ${publicKey.publicExponent}")
+                appendLine()
+                appendLine("SHA-256 fingerprint:")
+                appendLine(fingerprint)
+                appendLine()
+                appendLine("Key validation: SUCCESS")
+                appendLine("RSA public key successfully parsed.")
+                appendLine()
+                appendLine(
+                    "This validates key encoding, not device identity."
+                )
+            }.trim()
 
         } catch (e: Exception) {
             val prefix = data.take(24).joinToString(" ") {
@@ -1302,9 +1410,7 @@ class MainActivity : ComponentActivity() {
             buildString {
                 appendLine("PUBLIC KEY VALIDATION FAILED")
                 appendLine("Received bytes: ${data.size}")
-                appendLine(
-                    "Encoding: Not recognized as RSA X.509 SubjectPublicKeyInfo"
-                )
+                appendLine("Expected encoding: PKCS#1 RSA PUBLIC KEY")
                 appendLine()
                 appendLine("First 24 bytes:")
                 appendLine(prefix)
@@ -1312,9 +1418,7 @@ class MainActivity : ComponentActivity() {
                 appendLine(
                     "Error: ${e.message ?: e.javaClass.simpleName}"
                 )
-                appendLine()
-                appendLine("The key may use another encoding.")
-            }
+            }.trim()
         }
     }
 
