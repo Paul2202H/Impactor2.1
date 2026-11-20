@@ -2,30 +2,24 @@
 package com.impactor.android
 
 import android.os.SystemClock
-import java.io.ByteArrayOutputStream
 
 /**
- * Initial USBMUX2 pseudo-TCP connection implementation.
+ * Initial USBMUX2 pseudo-TCP connection.
  *
- * Connects to a TCP service through Apple's USBMUX2 transport.
- *
- * Implemented:
- * - USBMUX2 extended headers
- * - USBMUX packet sequence tracking
- * - TCP SYN
- * - TCP SYN-ACK validation
- * - TCP ACK
+ * Implements:
+ * - USBMUX2 extended packet headers
+ * - USBMUX sequence tracking
+ * - TCP SYN / SYN-ACK / ACK handshake
  *
  * Not yet implemented:
- * - TCP data transfer and flow control
- * - Retransmission
- * - Lockdown protocol
- * - Pairing
+ * - TCP data transfer
+ * - Flow control and retransmission
+ * - Lockdown protocol and pairing
  */
 class UsbMux2TcpConnection(
     private val transport: AppleUsbTransport,
     private val remotePort: Int = 62078,
-    private val localPort: Int = 1
+    private val localPort: Int = 49152
 ) {
 
     data class ConnectResult(
@@ -37,18 +31,20 @@ class UsbMux2TcpConnection(
     )
 
     companion object {
-        private const val PROTOCOL_TCP = 6
+        private const val PROTOCOL_TCP = 6L
+
         private const val MUX_HEADER_SIZE = 16
         private const val TCP_HEADER_SIZE = 20
         private const val MIN_PACKET_SIZE =
             MUX_HEADER_SIZE + TCP_HEADER_SIZE
 
-        private const val MUX_MAGIC = 0xFEEDFACE
+        private const val MUX_MAGIC = 0xFEEDFACEL
+
         private const val TCP_SYN = 0x02
         private const val TCP_ACK = 0x10
         private const val TCP_RST = 0x04
-        private const val TCP_WINDOW = 512
 
+        private const val TCP_WINDOW = 512
         private const val MAX_PACKET_SIZE = 16 * 1024
     }
 
@@ -61,14 +57,17 @@ class UsbMux2TcpConnection(
     private var receiveBuffer = ByteArray(0)
 
     @Volatile
-    var isConnected: Boolean = false
+    var isConnected = false
         private set
 
     @Synchronized
     fun connect(timeoutMs: Int = 7000): ConnectResult {
 
         if (isConnected) {
-            return result(true, "TCP connection is already established.")
+            return result(
+                true,
+                "TCP connection is already established."
+            )
         }
 
         require(remotePort in 1..65535)
@@ -76,25 +75,32 @@ class UsbMux2TcpConnection(
         require(timeoutMs > 0)
 
         receiveBuffer = ByteArray(0)
+
         muxTxSequence = 1
         muxRxSequence = 0xFFFF
+
         tcpTxSequence = 0L
         tcpRxAcknowledgement = 0L
 
         try {
-            // Send TCP SYN.
+            // Send initial TCP SYN.
             sendTcpPacket(
                 flags = TCP_SYN,
                 sequence = tcpTxSequence,
                 acknowledgement = tcpRxAcknowledgement
             )
 
-            val deadline = SystemClock.elapsedRealtime() + timeoutMs
+            val deadline =
+                SystemClock.elapsedRealtime() + timeoutMs
 
             while (SystemClock.elapsedRealtime() < deadline) {
 
                 val packet = readMuxPacket(deadline)
                     ?: continue
+
+                if (packet.size < MIN_PACKET_SIZE) {
+                    continue
+                }
 
                 val protocol = readUInt32BE(packet, 0)
 
@@ -104,14 +110,10 @@ class UsbMux2TcpConnection(
 
                 validateMuxHeader(packet)
 
-                // Acknowledge the device's USBMUX packet sequence.
-                muxRxSequence = readUInt16BE(packet, 12)
+                // USBMUX2 incoming rx_seq is at offset 14.
+                muxRxSequence = readUInt16BE(packet, 14)
 
                 val tcpOffset = MUX_HEADER_SIZE
-
-                if (packet.size < MIN_PACKET_SIZE) {
-                    continue
-                }
 
                 val sourcePort =
                     readUInt16BE(packet, tcpOffset)
@@ -131,13 +133,15 @@ class UsbMux2TcpConnection(
                 val flags =
                     packet[tcpOffset + 13].toInt() and 0xFF
 
-                if (dataOffset < TCP_HEADER_SIZE ||
+                if (
+                    dataOffset < TCP_HEADER_SIZE ||
                     packet.size < MUX_HEADER_SIZE + dataOffset
                 ) {
                     continue
                 }
 
-                if (sourcePort != remotePort ||
+                if (
+                    sourcePort != remotePort ||
                     destinationPort != localPort
                 ) {
                     continue
@@ -171,10 +175,10 @@ class UsbMux2TcpConnection(
                     )
                 }
 
-                // SYN consumes one TCP sequence number.
+                // The SYN consumes one TCP sequence number.
                 tcpTxSequence = expectedAcknowledgement
 
-                // Acknowledge the device's SYN.
+                // Acknowledge the remote SYN.
                 tcpRxAcknowledgement =
                     (remoteSequence + 1) and 0xFFFFFFFFL
 
@@ -190,7 +194,7 @@ class UsbMux2TcpConnection(
                     true,
                     "USBMUX2 pseudo-TCP handshake completed. " +
                         "Connected to port $remotePort. " +
-                        "Lockdown data exchange is not implemented yet.",
+                        "Lockdown communication is not implemented yet.",
                     packet.toHex()
                 )
             }
@@ -226,19 +230,20 @@ class UsbMux2TcpConnection(
         putUInt32BE(tcp, 4, sequence)
         putUInt32BE(tcp, 8, acknowledgement)
 
-        // TCP header length = 20 bytes.
+        // TCP header length: 20 bytes.
         tcp[12] = 0x50
-
         tcp[13] = flags.toByte()
 
         putUInt16BE(tcp, 14, TCP_WINDOW)
 
         // Checksum and urgent pointer are zero.
-        val packet = ByteArray(MUX_HEADER_SIZE + tcp.size)
+        val packet = ByteArray(
+            MUX_HEADER_SIZE + tcp.size
+        )
 
-        putUInt32BE(packet, 0, PROTOCOL_TCP.toLong())
+        putUInt32BE(packet, 0, PROTOCOL_TCP)
         putUInt32BE(packet, 4, packet.size.toLong())
-        putUInt32BE(packet, 8, MUX_MAGIC.toLong())
+        putUInt32BE(packet, 8, MUX_MAGIC)
 
         putUInt16BE(packet, 12, muxTxSequence)
         putUInt16BE(packet, 14, muxRxSequence)
@@ -258,20 +263,21 @@ class UsbMux2TcpConnection(
                 "$written/${packet.size} bytes."
         }
 
-        muxTxSequence = (muxTxSequence + 1) and 0xFFFF
+        muxTxSequence =
+            (muxTxSequence + 1) and 0xFFFF
     }
 
     private fun readMuxPacket(deadline: Long): ByteArray? {
 
         while (SystemClock.elapsedRealtime() < deadline) {
 
-            
             if (receiveBuffer.size >= 8) {
 
                 val packetLengthLong =
                     readUInt32BE(receiveBuffer, 4)
 
-                if (packetLengthLong < MIN_PACKET_SIZE.toLong() ||
+                if (
+                    packetLengthLong < MIN_PACKET_SIZE.toLong() ||
                     packetLengthLong > MAX_PACKET_SIZE.toLong()
                 ) {
                     throw IllegalStateException(
@@ -283,34 +289,40 @@ class UsbMux2TcpConnection(
 
                 if (receiveBuffer.size >= packetLength) {
 
-                    val packet =
-                        receiveBuffer.copyOfRange(0, packetLength)
+                    val packet = receiveBuffer.copyOfRange(
+                        0,
+                        packetLength
+                    )
 
-                    receiveBuffer =
-                        receiveBuffer.copyOfRange(
-                            packetLength,
-                            receiveBuffer.size
-                        )
+                    receiveBuffer = receiveBuffer.copyOfRange(
+                        packetLength,
+                        receiveBuffer.size
+                    )
 
                     return packet
                 }
             }
 
-
             val remaining =
                 deadline - SystemClock.elapsedRealtime()
 
-            if (remaining <= 0) break
+            if (remaining <= 0) {
+                break
+            }
 
             val chunk = transport.read(
                 maxBytes = 4096,
-                timeoutMs = minOf(remaining, 500L).toInt()
+                timeoutMs = minOf(remaining, 500L)
+                    .toInt()
                     .coerceAtLeast(1)
             )
 
             if (chunk != null && chunk.isNotEmpty()) {
 
-                if (receiveBuffer.size + chunk.size > MAX_PACKET_SIZE * 2) {
+                if (
+                    receiveBuffer.size + chunk.size >
+                    MAX_PACKET_SIZE * 2
+                ) {
                     throw IllegalStateException(
                         "USBMUX2 receive buffer exceeded its limit."
                     )
@@ -336,7 +348,7 @@ class UsbMux2TcpConnection(
             "USBMUX2 packet length mismatch."
         }
 
-        check(magic == MUX_MAGIC.toLong()) {
+        check(magic == MUX_MAGIC) {
             "Invalid USBMUX2 magic value."
         }
     }
@@ -398,9 +410,8 @@ class UsbMux2TcpConnection(
 
     @Synchronized
     fun close() {
-        // The underlying USB transport owns the physical connection.
-        // Closing that transport terminates this pseudo-TCP session.
         isConnected = false
         receiveBuffer = ByteArray(0)
     }
 }
+
