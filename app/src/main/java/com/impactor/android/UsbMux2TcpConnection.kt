@@ -85,10 +85,18 @@ class UsbMux2TcpConnection(
     // ---------------------------------------------------------
 
     private var muxTxSequence = 1
+
+    /*
+     * This is the RX value copied from the incoming USBMUX2
+     * header's offset 14.
+     */
     private var muxRxSequence = 0xFFFF
 
-    // Last acknowledgement received from the peer.
-    private var muxPeerAcknowledgement = 0xFFFF
+    /*
+     * Incoming offset 12 is the peer's TX sequence.
+     * Retained for diagnostics only.
+     */
+    private var muxPeerTxSequence = 0xFFFF
 
     // ---------------------------------------------------------
     // TCP-LIKE SEQUENCE TRACKING
@@ -721,7 +729,9 @@ class UsbMux2TcpConnection(
         }
 
         lastIncomingSummary =
-            "SEQ=${tcp.sequence} " +
+            "MUX_PEER_TX=$muxPeerTxSequence " +
+                "MUX_PEER_RX=$muxRxSequence\n" +
+                "SEQ=${tcp.sequence} " +
                 "ACK=${tcp.acknowledgement} " +
                 "FLAGS=0x${hexByte(tcp.flags)} " +
                 "PAYLOAD=${tcp.payload.size} " +
@@ -852,7 +862,9 @@ class UsbMux2TcpConnection(
         )
 
         lastIncomingSummary =
-            "SEQ=$sequence ACK=$acknowledgement " +
+            "MUX_PEER_TX=$muxPeerTxSequence " +
+                "MUX_PEER_RX=$muxRxSequence\n" +
+                "SEQ=$sequence ACK=$acknowledgement " +
                 "FLAGS=0x${hexByte(flags)} " +
                 "RAW_WINDOW=$rawWindow " +
                 "SCALED_WINDOW=${rawWindow shl 8} " +
@@ -944,6 +956,11 @@ class UsbMux2TcpConnection(
             muxTxSequence
         )
 
+        /*
+         * Correct USBMUX2 behavior:
+         * offset 14 contains the RX value observed in the
+         * incoming packet's offset 14.
+         */
         putUInt16BE(
             packet,
             14,
@@ -961,7 +978,7 @@ class UsbMux2TcpConnection(
         lastOutgoingSummary =
             "MUX_TX=$muxTxSequence " +
                 "MUX_RX=$muxRxSequence " +
-                "PEER_MUX_ACK=$muxPeerAcknowledgement " +
+                "PEER_TX=$muxPeerTxSequence " +
                 "TCP_SEQ=$sequence " +
                 "TCP_ACK=$acknowledgement " +
                 "FLAGS=0x${hexByte(flags)} " +
@@ -1111,19 +1128,22 @@ class UsbMux2TcpConnection(
         /*
          * USBMUX2 header:
          *
-         * Offset 12-13: Peer TX sequence
-         * Offset 14-15: Peer RX acknowledgement
+         * Offset 12-13: Peer TX sequence.
+         * Offset 14-15: Peer RX acknowledgement.
          *
-         * We acknowledge the peer's TX sequence in
-         * the RX sequence field of our outgoing packet.
+         * The peer's RX acknowledgement is copied into
+         * our outgoing RX field.
+         *
+         * IMPORTANT:
+         * Do not use offset 12 for muxRxSequence.
          */
 
-        muxRxSequence = readUInt16BE(
+        muxPeerTxSequence = readUInt16BE(
             packet,
             12
         )
 
-        muxPeerAcknowledgement = readUInt16BE(
+        muxRxSequence = readUInt16BE(
             packet,
             14
         )
@@ -1165,7 +1185,7 @@ class UsbMux2TcpConnection(
 
             appendLine("TX sequence: $muxTxSequence")
             appendLine("RX acknowledgement: $muxRxSequence")
-            appendLine("Peer MUX acknowledgement: $muxPeerAcknowledgement")
+            appendLine("Peer TX sequence: $muxPeerTxSequence")
 
             appendLine()
             appendLine("=== TCP-LIKE SEQUENCES ===")
@@ -1313,7 +1333,7 @@ class UsbMux2TcpConnection(
 
         muxTxSequence = 1
         muxRxSequence = 0xFFFF
-        muxPeerAcknowledgement = 0xFFFF
+        muxPeerTxSequence = 0xFFFF
 
         tcpTxSequence = 0L
         tcpTxAcknowledged = 0L
