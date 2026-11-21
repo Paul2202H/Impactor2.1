@@ -80,12 +80,19 @@ class UsbMux2TcpConnection(
         private const val SEQUENCE_HALF = 0x80000000L
     }
 
-    // USBMUX2 sequence tracking.
+    // ---------------------------------------------------------
+    // USBMUX2 SEQUENCE TRACKING
+    // ---------------------------------------------------------
 
     private var muxTxSequence = 1
     private var muxRxSequence = 0xFFFF
 
-    // TCP-like sequence tracking.
+    // Last acknowledgement received from the peer.
+    private var muxPeerAcknowledgement = 0xFFFF
+
+    // ---------------------------------------------------------
+    // TCP-LIKE SEQUENCE TRACKING
+    // ---------------------------------------------------------
 
     private var tcpTxSequence = 0L
     private var tcpTxAcknowledged = 0L
@@ -93,12 +100,16 @@ class UsbMux2TcpConnection(
 
     private var peerWindow = TCP_WINDOW_BYTES
 
-    // Incoming buffers.
+    // ---------------------------------------------------------
+    // INCOMING BUFFERS
+    // ---------------------------------------------------------
 
     private var receiveBuffer = ByteArray(0)
     private var pendingReceivedData = ByteArray(0)
 
-    // Diagnostics.
+    // ---------------------------------------------------------
+    // DIAGNOSTICS
+    // ---------------------------------------------------------
 
     private var lastReceivedPacket = ByteArray(0)
     private var lastReceivedBytes = ByteArray(0)
@@ -375,15 +386,6 @@ class UsbMux2TcpConnection(
                 }
 
                 if (!acknowledged) {
-
-                    /*
-                     * Do not immediately mark the connection
-                     * disconnected. Incoming data may still
-                     * be available for receive-only diagnostics.
-                     *
-                     * Do not send another request while the
-                     * previous segment remains unacknowledged.
-                     */
 
                     return TransferResult(
                         false,
@@ -959,6 +961,7 @@ class UsbMux2TcpConnection(
         lastOutgoingSummary =
             "MUX_TX=$muxTxSequence " +
                 "MUX_RX=$muxRxSequence " +
+                "PEER_MUX_ACK=$muxPeerAcknowledgement " +
                 "TCP_SEQ=$sequence " +
                 "TCP_ACK=$acknowledgement " +
                 "FLAGS=0x${hexByte(flags)} " +
@@ -1105,7 +1108,22 @@ class UsbMux2TcpConnection(
                 "0x${magic.toString(16)}."
         }
 
+        /*
+         * USBMUX2 header:
+         *
+         * Offset 12-13: Peer TX sequence
+         * Offset 14-15: Peer RX acknowledgement
+         *
+         * We acknowledge the peer's TX sequence in
+         * the RX sequence field of our outgoing packet.
+         */
+
         muxRxSequence = readUInt16BE(
+            packet,
+            12
+        )
+
+        muxPeerAcknowledgement = readUInt16BE(
             packet,
             14
         )
@@ -1147,6 +1165,7 @@ class UsbMux2TcpConnection(
 
             appendLine("TX sequence: $muxTxSequence")
             appendLine("RX acknowledgement: $muxRxSequence")
+            appendLine("Peer MUX acknowledgement: $muxPeerAcknowledgement")
 
             appendLine()
             appendLine("=== TCP-LIKE SEQUENCES ===")
@@ -1294,6 +1313,7 @@ class UsbMux2TcpConnection(
 
         muxTxSequence = 1
         muxRxSequence = 0xFFFF
+        muxPeerAcknowledgement = 0xFFFF
 
         tcpTxSequence = 0L
         tcpTxAcknowledged = 0L
