@@ -87,13 +87,12 @@ class UsbMux2TcpConnection(
     private var muxTxSequence = 1
 
     /*
-     * This is the RX value copied from the incoming USBMUX2
-     * header's offset 14.
+     * RX value copied from incoming USBMUX2 header offset 14.
      */
     private var muxRxSequence = 0xFFFF
 
     /*
-     * Incoming offset 12 is the peer's TX sequence.
+     * Incoming offset 12 is the peer TX sequence.
      * Retained for diagnostics only.
      */
     private var muxPeerTxSequence = 0xFFFF
@@ -114,6 +113,25 @@ class UsbMux2TcpConnection(
 
     private var receiveBuffer = ByteArray(0)
     private var pendingReceivedData = ByteArray(0)
+
+    // ---------------------------------------------------------
+    // RECEIVE HISTORY
+    // ---------------------------------------------------------
+
+    /*
+     * Preserves the most recently accepted TCP payload.
+     * This remains available even after pending data is drained.
+     */
+    private var lastAcceptedPayload = ByteArray(0)
+
+    /*
+     * Preserves the most recently returned receive payload.
+     */
+    private var lastDrainedPayload = ByteArray(0)
+
+    private var totalAcceptedPayloadBytes = 0L
+    private var totalDrainedPayloadBytes = 0L
+    private var receiveDrainCount = 0
 
     // ---------------------------------------------------------
     // DIAGNOSTICS
@@ -529,6 +547,13 @@ class UsbMux2TcpConnection(
             count
         )
 
+        // Preserve the returned data for diagnostics.
+        lastDrainedPayload = output.copyOf()
+
+        totalDrainedPayloadBytes += output.size
+        receiveDrainCount++
+
+        // Remove only the bytes returned to the caller.
         pendingReceivedData = pendingReceivedData.copyOfRange(
             count,
             pendingReceivedData.size
@@ -598,6 +623,79 @@ class UsbMux2TcpConnection(
     }
 
     // ---------------------------------------------------------
+    // RECEIVE HISTORY DIAGNOSTICS
+    // ---------------------------------------------------------
+
+    @Synchronized
+    fun getReceiveHistoryDiagnostics(): String {
+
+        return buildString {
+
+            appendLine("=== RECEIVE HISTORY ===")
+
+            appendLine(
+                "Total accepted: $totalAcceptedPayloadBytes bytes"
+            )
+
+            appendLine(
+                "Total drained: $totalDrainedPayloadBytes bytes"
+            )
+
+            appendLine(
+                "Drain operations: $receiveDrainCount"
+            )
+
+            appendLine(
+                "Currently pending: ${pendingReceivedData.size} bytes"
+            )
+
+            appendLine()
+
+            appendLine("=== LAST ACCEPTED PAYLOAD ===")
+
+            appendLine(
+                if (lastAcceptedPayload.isEmpty()) {
+                    "No accepted payload recorded."
+                } else {
+                    indexedHex(lastAcceptedPayload)
+                }
+            )
+
+            appendLine()
+
+            appendLine("=== LAST DRAINED PAYLOAD ===")
+
+            appendLine(
+                if (lastDrainedPayload.isEmpty()) {
+                    "No drained payload recorded."
+                } else {
+                    indexedHex(lastDrainedPayload)
+                }
+            )
+
+            appendLine()
+
+            appendLine("=== CURRENT PENDING PAYLOAD ===")
+
+            appendLine(
+                if (pendingReceivedData.isEmpty()) {
+                    "No pending payload."
+                } else {
+                    indexedHex(
+                        pendingReceivedData.copyOfRange(
+                            0,
+                            minOf(
+                                pendingReceivedData.size,
+                                MAX_DIAGNOSTIC_BYTES
+                            )
+                        )
+                    )
+                }
+            )
+        }
+    }
+
+    // ---------------------------------------------------------
     // INCOMING PACKET PROCESSING
     // ---------------------------------------------------------
 
@@ -662,7 +760,13 @@ class UsbMux2TcpConnection(
                     "Pending TCP data buffer limit exceeded."
                 }
 
+                // Store the payload in the receive buffer.
                 pendingReceivedData += tcp.payload
+
+                // Preserve a copy for receive-history diagnostics.
+                lastAcceptedPayload = tcp.payload.copyOf()
+
+                totalAcceptedPayloadBytes += tcp.payload.size
 
                 lastPacketAcceptedBytes = tcp.payload.size
 
@@ -957,9 +1061,8 @@ class UsbMux2TcpConnection(
         )
 
         /*
-         * Correct USBMUX2 behavior:
-         * offset 14 contains the RX value observed in the
-         * incoming packet's offset 14.
+         * Outgoing USBMUX2 RX field:
+         * Copy the value observed in incoming header offset 14.
          */
         putUInt16BE(
             packet,
@@ -1126,15 +1229,9 @@ class UsbMux2TcpConnection(
         }
 
         /*
-         * USBMUX2 header:
+         * Offset 12: Peer TX sequence.
+         * Offset 14: Peer RX acknowledgement.
          *
-         * Offset 12-13: Peer TX sequence.
-         * Offset 14-15: Peer RX acknowledgement.
-         *
-         * The peer's RX acknowledgement is copied into
-         * our outgoing RX field.
-         *
-         * IMPORTANT:
          * Do not use offset 12 for muxRxSequence.
          */
 
@@ -1316,6 +1413,14 @@ class UsbMux2TcpConnection(
 
         receiveBuffer = ByteArray(0)
         pendingReceivedData = ByteArray(0)
+
+        // Reset receive history.
+        lastAcceptedPayload = ByteArray(0)
+        lastDrainedPayload = ByteArray(0)
+
+        totalAcceptedPayloadBytes = 0L
+        totalDrainedPayloadBytes = 0L
+        receiveDrainCount = 0
 
         lastReceivedPacket = ByteArray(0)
         lastReceivedBytes = ByteArray(0)
