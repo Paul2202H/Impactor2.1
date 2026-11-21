@@ -1150,7 +1150,7 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------------------------------------------------------
-    // APPLE LOCKDOWN PAIRING
+    // APPLE LOCKDOWN PAIRING - UPDATED
     // ---------------------------------------------------------
 
     private fun pairAppleDevice() {
@@ -1158,14 +1158,12 @@ class MainActivity : ComponentActivity() {
         val connection = lockdownTcp
 
         if (connection == null || !connection.isConnected) {
-            status.value =
-                "Connect to Lockdown before pairing."
+            status.value = "Connect to Lockdown before pairing."
             return
         }
 
         if (lockdownTestRunning || pairingRunningState.value) {
-            status.value =
-                "Another Lockdown operation is running."
+            status.value = "Another Lockdown operation is running."
             return
         }
 
@@ -1175,86 +1173,49 @@ class MainActivity : ComponentActivity() {
         pairingInfo.value =
             "Preparing Apple pairing request..."
 
-        status.value =
-            "Starting Lockdown pairing..."
+        status.value = "Starting Lockdown pairing..."
 
         lifecycleScope.launch {
 
             try {
 
                 // Retrieve the iPad's RSA public key.
-
                 val publicKey = getDevicePublicKey(connection)
 
                 pairingInfo.value =
                     "Device public key retrieved. Sending pairing request..."
 
-                // Send the Pair request through the existing
-                // USBMUX2 TCP Lockdown connection.
-
                 val result = pairingManager.pair(
                     devicePublicKeyPem = publicKey
                 ) { framedRequest ->
 
+                    // Send the framed Lockdown Pair request.
                     val sendResult = connection.sendData(
                         data = framedRequest,
                         timeoutMs = 10000
                     )
 
-                    if (!sendResult.success) {
+                    if (sendResult.success) {
 
-                        // Try to retrieve data that may already
-                        // have been buffered by the USBMUX2 transport.
+                        // All outgoing bytes were acknowledged.
+                        // Read the normal Lockdown response.
+                        receiveLockdownFrame(
+                            connection = connection,
+                            timeoutMs = 20000
+                        )
 
-                        val bufferedResult = runCatching {
-                            connection.receiveData(
-                                maxBytes = 16384,
-                                timeoutMs = 1000
-                            )
-                        }
+                    } else {
 
-                        val bufferedData =
-                            bufferedResult.getOrNull()?.data
-                                ?: ByteArray(0)
+                        // IMPORTANT:
+                        // Do not call receiveData() separately to
+                        // inspect the buffer. It may consume the
+                        // actual Lockdown response.
 
-                        val bufferedHex =
-                            bufferedData.joinToString(" ") {
-                                "%02X".format(
-                                    it.toInt() and 0xFF
-                                )
-                            }
+                        val sendDiagnostic = buildString {
 
-                        val bufferedAscii =
-                            bufferedData.map { byte ->
-                                val value =
-                                    byte.toInt() and 0xFF
-
-                                if (value in 32..126) {
-                                    value.toChar()
-                                } else {
-                                    '.'
-                                }
-                            }.joinToString("")
-
-                        val pendingDiagnostics =
-                            runCatching {
-                                connection.getPendingDataDiagnostics()
-                            }.getOrElse {
-                                "Unable to retrieve pending-data diagnostics: ${it.message}"
-                            }
-
-                        val diagnostic = buildString {
-
-                            appendLine(
-                                "Pair request acknowledgement failed."
-                            )
-
-                            appendLine()
-                            appendLine("SEND RESULT:")
+                            appendLine("PAIR REQUEST SEND WARNING")
                             appendLine(sendResult.message)
-
                             appendLine()
-                            appendLine("TRANSFER INFORMATION:")
 
                             appendLine(
                                 "Bytes transferred: ${sendResult.bytesTransferred}"
@@ -1267,51 +1228,69 @@ class MainActivity : ComponentActivity() {
                             appendLine(
                                 "Remote closed: ${connection.isRemoteClosed}"
                             )
-
-                            appendLine()
-                            appendLine(
-                                "BUFFERED RESPONSE SIZE: ${bufferedData.size} bytes"
-                            )
-
-                            appendLine()
-                            appendLine("BUFFERED RESPONSE HEX:")
-
-                            appendLine(
-                                bufferedHex.ifBlank {
-                                    "No data returned by receiveData()."
-                                }
-                            )
-
-                            appendLine()
-                            appendLine("BUFFERED RESPONSE TEXT:")
-
-                            appendLine(
-                                bufferedAscii.ifBlank {
-                                    "No readable data."
-                                }
-                            )
-
-                            appendLine()
-                            appendLine("TRANSPORT DIAGNOSTICS:")
-                            appendLine(pendingDiagnostics)
                         }
 
-                        throw IllegalStateException(diagnostic)
+                        // The iPad may already have sent its response
+                        // even if the final outgoing TCP segment
+                        // was not acknowledged.
+                        val responseAttempt = runCatching {
+
+                            receiveLockdownFrame(
+                                connection = connection,
+                                timeoutMs = 10000
+                            )
+                        }
+
+                        if (responseAttempt.isSuccess) {
+
+                            val response =
+                                responseAttempt.getOrThrow()
+
+                            diagnosticReport.value +=
+                                "\n\n$sendDiagnostic" +
+                                    "\nLockdown response received despite the send acknowledgement timeout."
+
+                            // Return the actual response to
+                            // ApplePairingManager for parsing.
+                            response
+
+                        } else {
+
+                            val receiveError =
+                                responseAttempt.exceptionOrNull()
+
+                            val transportDiagnostics =
+                                runCatching {
+                                    connection.getPendingDataDiagnostics()
+                                }.getOrElse {
+                                    "Unable to retrieve transport diagnostics: ${it.message}"
+                                }
+
+                            throw IllegalStateException(
+                                buildString {
+
+                                    appendLine(sendDiagnostic)
+                                    appendLine()
+                                    appendLine("LOCKDOWN RESPONSE FAILED")
+
+                                    appendLine(
+                                        receiveError?.message
+                                            ?: "No response received."
+                                    )
+
+                                    appendLine()
+                                    appendLine("TRANSPORT DIAGNOSTICS")
+                                    appendLine(transportDiagnostics)
+                                }
+                            )
+                        }
                     }
-
-                    // The complete request was acknowledged.
-                    // Now wait for the Lockdown response.
-
-                    receiveLockdownFrame(
-                        connection = connection,
-                        timeoutMs = 20000
-                    )
                 }
-
-                pairingInfo.value = result.message
 
                 val saved =
                     pairingManager.hasSavedPairing()
+
+                pairingInfo.value = result.message
 
                 status.value =
                     if (result.success && saved) {
@@ -1325,29 +1304,64 @@ class MainActivity : ComponentActivity() {
                     appendLine("APPLE PAIRING RESULT")
                     appendLine("Date: ${java.util.Date()}")
                     appendLine()
+
                     appendLine("Success: ${result.success}")
                     appendLine("Saved identity: $saved")
                     appendLine()
+
                     appendLine("Message:")
                     appendLine(result.message)
                     appendLine()
+
                     appendLine("Lockdown response:")
                     appendLine(result.response)
+                    appendLine()
+
+                    appendLine("TRANSPORT DIAGNOSTICS:")
+                    appendLine(
+                        connection.getPendingDataDiagnostics()
+                    )
                 }
 
                 diagnosticReport.value += "\n\n$report"
 
             } catch (e: Exception) {
 
-                val error =
-                    "Pairing failed: " +
-                        "${e.message ?: e.javaClass.simpleName}"
+                val error = buildString {
+
+                    appendLine("APPLE PAIRING ERROR")
+
+                    appendLine(
+                        "${e.javaClass.simpleName}: ${e.message ?: "Unknown error"}"
+                    )
+
+                    appendLine()
+                    appendLine("TRANSPORT STATE")
+
+                    appendLine(
+                        "Connected: ${connection.isConnected}"
+                    )
+
+                    appendLine(
+                        "Remote closed: ${connection.isRemoteClosed}"
+                    )
+
+                    appendLine()
+                    appendLine("TRANSPORT DIAGNOSTICS")
+
+                    appendLine(
+                        runCatching {
+                            connection.getPendingDataDiagnostics()
+                        }.getOrElse {
+                            "Unable to retrieve diagnostics: ${it.message}"
+                        }
+                    )
+                }
 
                 pairingInfo.value = error
                 status.value = "Apple pairing failed."
 
-                diagnosticReport.value +=
-                    "\n\nAPPLE PAIRING ERROR\n$error"
+                diagnosticReport.value += "\n\n$error"
 
             } finally {
 
